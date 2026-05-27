@@ -94,7 +94,7 @@ const vendorsTpl = `{{ define "vendors" }}
 <h2>Vendors</h2>
 <p class="muted">Top of the list is most preferred. Espur always tries from the top.</p>
 <table>
-  <thead><tr><th>#</th><th>vendor_id</th><th>model</th><th>enabled</th><th>cred</th><th>penalty</th><th>actions</th></tr></thead>
+  <thead><tr><th>#</th><th>vendor_id</th><th>model</th><th>enabled</th><th>kind</th><th>cred</th><th>penalty</th><th>actions</th></tr></thead>
   <tbody>
   {{ range $i, $r := . }}
   <tr>
@@ -102,6 +102,7 @@ const vendorsTpl = `{{ define "vendors" }}
     <td><code>{{ $r.Vendor.VendorID }}</code></td>
     <td><code>{{ $r.Vendor.Model }}</code></td>
     <td>{{ if $r.Vendor.Enabled }}yes{{ else }}<span class="muted">no</span>{{ end }}</td>
+    <td>{{ $r.Vendor.CredKind }}</td>
     <td>{{ $r.CredStatus }}</td>
     <td>
       {{ if eq (printf "%s" $r.Penalty.Status) "auth_locked" }}auth-locked
@@ -123,6 +124,7 @@ const vendorsTpl = `{{ define "vendors" }}
       <form method="post" action="/vendors/{{ $r.Vendor.VendorID }}/delete" style="display:inline" onsubmit="return confirm('Delete {{ $r.Vendor.VendorID }}?')">
         <button class="contrast">delete</button>
       </form>
+      {{ if eq $r.Vendor.CredKind "byo_key" }}
       <details>
         <summary>set key</summary>
         <form method="post" action="/vendors/{{ $r.Vendor.VendorID }}/key">
@@ -131,10 +133,11 @@ const vendorsTpl = `{{ define "vendors" }}
           <button>save</button>
         </form>
       </details>
+      {{ end }}
     </td>
   </tr>
   {{ else }}
-  <tr><td colspan="7" class="muted">no vendors yet — add one below</td></tr>
+  <tr><td colspan="8" class="muted">no vendors yet — add one below</td></tr>
   {{ end }}
   </tbody>
 </table>
@@ -143,7 +146,12 @@ const vendorsTpl = `{{ define "vendors" }}
 <form method="post" action="/vendors/add">
   <label>vendor_id <input name="vendor_id" required placeholder="anthropic-byo"></label>
   <label>model <input name="model" required placeholder="anthropic/claude-haiku-4-5"></label>
-  <label>env var name (for credentials) <input name="env_key" placeholder="ANTHROPIC_API_KEY"></label>
+  <fieldset>
+    <legend>Credential source</legend>
+    <label><input type="radio" name="cred_kind" value="byo_key" checked> BYO API key (set via "set key" after add)</label>
+    <label><input type="radio" name="cred_kind" value="oauth"> OAuth (managed by <code>opencode auth login</code>, see <a href="/oauth">oauth page</a>)</label>
+  </fieldset>
+  <label>env var name (BYO only — ignored for OAuth) <input name="env_key" placeholder="ANTHROPIC_API_KEY"></label>
   <button>add</button>
 </form>
 {{ end }}`

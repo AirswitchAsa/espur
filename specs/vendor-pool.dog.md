@@ -29,7 +29,7 @@ A vendor attempt is classified as a **failure** (eligible for fallthrough + pena
 - HTTP **429** from the upstream API.
 - Substring matches (case-insensitive) for vendor-side throttling: `quota exceeded`, `usage limit`, `rate limit`, `high concurrency`, `overloaded`, `try again later`.
 - Persistent **5xx** from the upstream API (any 5xx counts; a single 5xx is enough to trigger fallthrough, but only escalates the penalty on repeat — see backoff below).
-- HTTP **401** or **403** from the upstream API, **or** any opencode error string clearly indicating auth (`invalid api key`, `unauthorized`, `expired token`, `revoked`). This is the "auth failure" sub-class.
+- HTTP **401** or **403** from the upstream API, **or** any opencode error string clearly indicating auth (`invalid api key`, `unauthorized`, `expired token`, `revoked`), **or** an opencode-side configuration error that is structurally equivalent — `model not found`, `unknown provider`, `provider not configured`. All of these mean the vendor row is unusable until the operator intervenes (re-auth, fix model id, re-add credentials), so they share the auth-failure bucket and the `auth_locked` permanent penalty.
 
 Patterns are seeded from the `opencode-rate-limit-fallback` plugin source and may be extended over time. The full pattern list lives in code, not in this spec.
 

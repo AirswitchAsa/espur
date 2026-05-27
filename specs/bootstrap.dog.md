@@ -15,6 +15,7 @@ The Espur binary is started by the operator (directly, via `air` in dev, or as a
    - `ESPUR_LOG_LEVEL` (`debug`/`info`/`warn`/`error`, default `info`)
    - `ESPUR_DASHBOARD_URL` (used in [[reply]]'s drained message)
    - `ESPUR_OPENCODE_TIMEOUT` (default `120s`)
+   - `ESPUR_OPENCODE_MAX_CONCURRENT` (global cap on concurrent opencode children; default `4`, `0` disables — see [[opencode-invoke]])
    - `ESPUR_SHUTDOWN_DRAIN` (phase-2 drain deadline; default `30s`, floored to `ESPUR_OPENCODE_TIMEOUT` so an in-flight invocation always gets one full attempt window — see [[shutdown]])
    - `ESPUR_DISCORD_TOKEN` (presence enables the Discord adapter)
    - `ESPUR_WECHAT_ENABLED` (`1`/`true` opts into the personal-WeChat adapter; QR-login flow per [[adapter]])

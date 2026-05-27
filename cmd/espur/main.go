@@ -60,6 +60,7 @@ func run() (int, error) {
 	logLevel := envOr("ESPUR_LOG_LEVEL", "info")
 	dashboardURL := os.Getenv("ESPUR_DASHBOARD_URL")
 	invokeTimeout := parseDuration(os.Getenv("ESPUR_OPENCODE_TIMEOUT"), 120*time.Second)
+	maxConcurrent := parseIntOr("ESPUR_OPENCODE_MAX_CONCURRENT", vendor.DefaultMaxConcurrent)
 	drainDeadline := parseDuration(os.Getenv("ESPUR_SHUTDOWN_DRAIN"), 30*time.Second)
 	if drainDeadline < invokeTimeout {
 		// Spec: drain deadline ≥ invoke timeout, so the in-flight invocation
@@ -100,7 +101,9 @@ func run() (int, error) {
 	logger.Info("secrets self-test passed", "event", obs.SecretsSelfTest)
 
 	// 5. Vendor pool — state lives in DB; pool is a thin lookup over it.
-	pool := vendor.New(db, vault).WithLogger(logger)
+	pool := vendor.New(db, vault).
+		WithLogger(logger).
+		WithMaxConcurrent(maxConcurrent)
 
 	// 6. Construct adapters (Discord only in v0.1; WeChat would join here).
 	ts := transcript.NewStore(dataDir)
@@ -283,6 +286,18 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func parseIntOr(k string, def int) int {
+	s := os.Getenv(k)
+	if s == "" {
+		return def
+	}
+	var n int
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		return def
+	}
+	return n
 }
 
 func parseDuration(s string, def time.Duration) time.Duration {

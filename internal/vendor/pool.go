@@ -29,18 +29,31 @@ func (realInvoker) Invoke(ctx context.Context, req opencode.Request) (opencode.R
 	return opencode.Invoke(ctx, req)
 }
 
+// DefaultMaxConcurrent is the default global cap on concurrent opencode
+// children across all per-thread queues. Per-thread serialization is the
+// adapter/queue's job; this cap bounds total resource use on the host.
+// Overridable via ESPUR_OPENCODE_MAX_CONCURRENT at the call site.
+const DefaultMaxConcurrent = 4
+
 // Pool is the live vendor pool, backed by the store. Safe for concurrent use.
+//
+// Per-vendor penalty state can race in theory (two concurrent Runs both see
+// a vendor as eligible and both invoke it). The races are benign: PutPenalty
+// is a full-row upsert, so the worst case is FailureStreak over-counting by
+// one. Cooldown still fires correctly. See specs/vendor-pool.dog.md.
 type Pool struct {
-	mu      sync.Mutex
 	db      *store.DB
 	vault   *secrets.Vault
 	invoker Invoker
 	now     func() time.Time
 	rng     *rand.Rand
+	rngMu   sync.Mutex // math/rand.Rand is not safe for concurrent use
 	logger  *slog.Logger
+	sem     chan struct{} // global concurrency bound; nil disables the cap
 }
 
-// New constructs a pool with the real opencode invoker and default clock.
+// New constructs a pool with the real opencode invoker and default clock,
+// with the global concurrency cap at DefaultMaxConcurrent.
 func New(db *store.DB, vault *secrets.Vault) *Pool {
 	return &Pool{
 		db:      db,
@@ -49,7 +62,19 @@ func New(db *store.DB, vault *secrets.Vault) *Pool {
 		now:     time.Now,
 		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
 		logger:  slog.Default(),
+		sem:     make(chan struct{}, DefaultMaxConcurrent),
 	}
+}
+
+// WithMaxConcurrent sets the global cap on concurrent opencode children.
+// n <= 0 disables the cap (no semaphore). Returns p for chaining.
+func (p *Pool) WithMaxConcurrent(n int) *Pool {
+	if n <= 0 {
+		p.sem = nil
+	} else {
+		p.sem = make(chan struct{}, n)
+	}
+	return p
 }
 
 // WithLogger swaps the logger used for vendor-pool transitions.
@@ -127,8 +152,18 @@ type PenalizedSnapshot struct {
 // userMsg is the composite message from internal/context (already wrapped).
 // workDir is the per-thread working directory.
 func (p *Pool) Run(ctx context.Context, workDir, userMsg string, timeout time.Duration) (Result, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// Global concurrency cap. Acquire before any vendor walking — once we
+	// hold a slot, the rest of this call is allowed to spawn at most one
+	// opencode child at a time (the per-attempt switch inside the loop is
+	// sequential).
+	if p.sem != nil {
+		select {
+		case p.sem <- struct{}{}:
+			defer func() { <-p.sem }()
+		case <-ctx.Done():
+			return Result{}, ctx.Err()
+		}
+	}
 
 	vendors, err := p.db.ListVendors(ctx)
 	if err != nil {
@@ -216,7 +251,9 @@ func (p *Pool) Run(ctx context.Context, workDir, userMsg string, timeout time.Du
 				return res, ocErr
 			}
 			// Vendor-side failure: penalize and try the next eligible vendor.
+			p.rngMu.Lock()
 			updated := applyFailure(pen, class, p.now(), p.rng)
+			p.rngMu.Unlock()
 			if err := p.db.PutPenalty(ctx, updated); err != nil {
 				return res, err
 			}

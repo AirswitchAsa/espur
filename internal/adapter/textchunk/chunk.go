@@ -35,6 +35,11 @@ func Split(body string, maxLen int) []string {
 	}
 	lines := strings.Split(body, "\n")
 	for i, line := range lines {
+		// Snapshot fence state from the START of this iteration. The line
+		// itself may close the fence we are in — and a closing fence line
+		// must be flushed *with* the open block, not after it, so the cap
+		// check uses the pre-toggle state.
+		wasInFence := inFence
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "```") {
 			if !inFence {
@@ -48,7 +53,7 @@ func Split(body string, maxLen int) []string {
 		if i > 0 {
 			addition = "\n" + line
 		}
-		if current.Len()+len(addition) > maxLen && !inFence && current.Len() > 0 {
+		if current.Len()+len(addition) > maxLen && !wasInFence && current.Len() > 0 {
 			flush()
 			addition = line
 		}

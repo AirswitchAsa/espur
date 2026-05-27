@@ -167,25 +167,46 @@ func (s *Server) vendorAdd(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.FormValue("vendor_id"))
 	model := strings.TrimSpace(r.FormValue("model"))
 	envKey := strings.TrimSpace(r.FormValue("env_key"))
+	credKind := strings.TrimSpace(r.FormValue("cred_kind"))
+	if credKind == "" {
+		credKind = "byo_key"
+	}
+	if credKind != "byo_key" && credKind != "oauth" {
+		http.Error(w, "cred_kind must be byo_key or oauth", 400)
+		return
+	}
 	if id == "" || model == "" {
 		http.Error(w, "vendor_id and model required", 400)
+		return
+	}
+	if credKind == "byo_key" && envKey == "" {
+		http.Error(w, "env_key required for BYO API key vendors", 400)
 		return
 	}
 	ctx := r.Context()
 	vs, _ := s.db.ListVendors(ctx)
 	pos := len(vs)
 	if err := s.db.UpsertVendor(ctx, store.Vendor{
-		VendorID: id, Model: model, Enabled: true, Position: pos, CredKind: "byo_key",
+		VendorID: id, Model: model, Enabled: true, Position: pos, CredKind: credKind,
 	}); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	// Seed an empty credential row so its env_keys are remembered (the key
-	// itself is set via /vendors/{id}/key).
-	if envKey != "" {
+	switch credKind {
+	case "byo_key":
+		// Seed an empty credential row so its env_keys are remembered (the
+		// key itself is set via /vendors/{id}/key).
 		_ = s.db.PutCredential(ctx, store.Credential{
 			Scope: "vendor", ID: id, Kind: "byo_key", Status: "missing",
 			EnvKeys: []string{envKey},
+		})
+	case "oauth":
+		// OAuth vendors carry no Espur-side credential blob. The credential
+		// row exists only so the vendors page can render status=set without
+		// hitting the load path. opencode reads its own auth.json — see
+		// specs/oauth.dog.md.
+		_ = s.db.PutCredential(ctx, store.Credential{
+			Scope: "vendor", ID: id, Kind: "oauth", Status: "set",
 		})
 	}
 	http.Redirect(w, r, "/vendors", http.StatusSeeOther)

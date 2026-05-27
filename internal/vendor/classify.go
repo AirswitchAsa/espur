@@ -54,6 +54,17 @@ var authPhrases = []string{
 	"revoked",
 	"authentication_error",
 	"authentication failed",
+	// opencode-side classification: these mean the operator has to
+	// fix the vendor row (wrong model id, provider not authed via
+	// `opencode auth login`). Same remediation as a real auth failure,
+	// so they go in the auth_locked bucket. Without this, the pool would
+	// treat them as genuine crashes and refuse to fall through. Observed
+	// against opencode 1.15.x with an unauthed provider:
+	//   "Model not found: openai/gpt-4o-mini..."
+	"model not found",
+	"unknown provider",
+	"provider not configured",
+	"no provider for",
 }
 
 // Classify inspects opencode's stdout (JSON event stream, often containing

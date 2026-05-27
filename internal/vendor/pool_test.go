@@ -150,6 +150,8 @@ func TestClassify_Buckets(t *testing.T) {
 		{"5xx", `"statusCode":503`, ClassServer5xx},
 		{"auth-phrase", `invalid api key`, ClassAuth},
 		{"401-http", `"statusCode":401`, ClassAuth},
+		{"opencode-model-not-found", `Model not found: openai/gpt-4o-mini. Did you mean: gpt-4o-mini?`, ClassAuth},
+		{"opencode-unknown-provider", `unknown provider for some-model`, ClassAuth},
 		{"clean", `here is your answer`, ClassNone},
 	}
 	for _, c := range cases {

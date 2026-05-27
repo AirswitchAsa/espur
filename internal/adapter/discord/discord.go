@@ -1,4 +1,4 @@
-// Package discord implements the Discord IM adapter. See specs/adapter.dog.md
+// Package discord implements the Discord IM adapter. See docs/specs/adapter.dog.md
 // — this package is the only place in Espur that knows Discord's wire format,
 // mention semantics, and chunking limits.
 package discord
@@ -77,7 +77,7 @@ func (a *Adapter) Start(ctx context.Context) (<-chan adapter.Event, error) {
 }
 
 // emitBudget is the max time emit will wait to push an event onto the
-// inbound channel. Per specs/adapter.dog.md: "If full for >1s, the adapter
+// inbound channel. Per docs/specs/adapter.dog.md: "If full for >1s, the adapter
 // logs at warn and drops." Package-level so tests can shrink it.
 var emitBudget = time.Second
 
@@ -86,7 +86,7 @@ func (a *Adapter) emit(ev adapter.Event) {
 	case a.events <- ev:
 		return
 	case <-time.After(emitBudget):
-		// Channel backpressure. Per specs/adapter.dog.md, repeated drops
+		// Channel backpressure. Per docs/specs/adapter.dog.md, repeated drops
 		// must emit a Disconnected{cause="downstream backpressure"} so the
 		// operator sees something in the web UI status panel. The transport
 		// stays up; this is a signal to fix the downstream, not the adapter.
@@ -135,7 +135,7 @@ var mentionRE = regexp.MustCompile(`<@!?(\d+)>`)
 
 // normalizeBody strips the bot's mention token from the message body, renders
 // attachments to placeholder text, and reports whether the bot was mentioned.
-// Exported semantics live in specs/adapter.dog.md "Inbound normalizer".
+// Exported semantics live in docs/specs/adapter.dog.md "Inbound normalizer".
 func normalizeBody(m *discordgo.Message, botUserID string) (string, bool) {
 	body := m.Content
 	mentioned := false

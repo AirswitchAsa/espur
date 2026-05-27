@@ -1,6 +1,6 @@
 // Auth-file inspection. Espur does not own OAuth flows — it delegates to
 // `opencode auth login` which writes ~/.local/share/opencode/auth.json
-// (overridden by XDG_DATA_HOME). See specs/oauth.dog.md "Delegation model."
+// (overridden by XDG_DATA_HOME). See docs/specs/oauth.dog.md "Delegation model."
 // This file is the read-only view the web UI uses to display per-provider
 // status.
 

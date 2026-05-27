@@ -1,4 +1,4 @@
-// Package web is the operator-facing admin UI per specs/webui.dog.md.
+// Package web is the operator-facing admin UI per docs/specs/webui.dog.md.
 // Kept deliberately minimal in v0.1: plain html/template, no JS build, no
 // htmx, no OAuth — BYO API key only. Pages: status home, vendors,
 // threads list, thread detail peek.
@@ -204,7 +204,7 @@ func (s *Server) vendorAdd(w http.ResponseWriter, r *http.Request) {
 		// OAuth vendors carry no Espur-side credential blob. The credential
 		// row exists only so the vendors page can render status=set without
 		// hitting the load path. opencode reads its own auth.json — see
-		// specs/oauth.dog.md.
+		// docs/specs/oauth.dog.md.
 		_ = s.db.PutCredential(ctx, store.Credential{
 			Scope: "vendor", ID: id, Kind: "oauth", Status: "set",
 		})

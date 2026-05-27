@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// Vendor is one row in the priority list. See specs/vendor-pool.dog.md.
+// Vendor is one row in the priority list. See docs/specs/vendor-pool.dog.md.
 type Vendor struct {
 	VendorID string
 	Model    string
@@ -15,7 +15,7 @@ type Vendor struct {
 	CredKind string // byo_key | oauth | ...
 }
 
-// PenaltyStatus matches specs/vendor-pool.dog.md.
+// PenaltyStatus matches docs/specs/vendor-pool.dog.md.
 type PenaltyStatus string
 
 const (

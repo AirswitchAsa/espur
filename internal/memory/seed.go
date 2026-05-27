@@ -1,5 +1,5 @@
 // Package memory materializes the per-thread working directory and seeds
-// AGENTS.md per specs/memory-seed.dog.md.
+// AGENTS.md per docs/specs/memory-seed.dog.md.
 package memory
 
 import (
@@ -8,7 +8,7 @@ import (
 )
 
 // agentsMD is the seed file written into a new thread's working directory.
-// The wording realizes the rule list pinned in specs/memory-seed.dog.md.
+// The wording realizes the rule list pinned in docs/specs/memory-seed.dog.md.
 const agentsMD = `# Long-term memory for this thread
 
 This file is your durable memory for this conversation thread. It survives
@@ -48,7 +48,7 @@ own this directory.
 `
 
 // EnsureWorkDir creates the working directory and seeds AGENTS.md if missing.
-// Idempotent — see specs/memory-seed.dog.md "Idempotency".
+// Idempotent — see docs/specs/memory-seed.dog.md "Idempotency".
 func EnsureWorkDir(workDir string) error {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return err

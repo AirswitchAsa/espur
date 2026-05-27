@@ -10,7 +10,7 @@ import (
 // TestEmit_BackpressureSurfacesDisconnected verifies that when the events
 // channel is wedged for longer than the emit budget, the adapter surfaces
 // a Disconnected{cause="downstream backpressure"} lifecycle event so the
-// operator can see the drop in the web UI. specs/adapter.dog.md.
+// operator can see the drop in the web UI. docs/specs/adapter.dog.md.
 func TestEmit_BackpressureSurfacesDisconnected(t *testing.T) {
 	prev := emitBudget
 	emitBudget = 20 * time.Millisecond

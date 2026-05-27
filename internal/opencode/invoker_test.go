@@ -15,7 +15,7 @@ import (
 // ~/.local/share/opencode/auth.json on this dev box). Switching vendors is a
 // matter of changing the Model + CredEnv block below.
 //
-// The composite user message follows specs/context-assembly.dog.md
+// The composite user message follows docs/specs/context-assembly.dog.md
 // ("<thread-context>…</thread-context>" + "<request>…</request>").
 //
 // Skipped automatically unless ESPUR_OPENCODE_LIVE=1 — keeps `go test ./...`

@@ -9,7 +9,7 @@ import (
 	"github.com/punny/espur/internal/vendor"
 )
 
-// crockford32 — pinned per specs/reply.dog.md TODO(decision): 8-char Crockford
+// crockford32 — pinned per docs/specs/reply.dog.md TODO(decision): 8-char Crockford
 // base32 token used as the request id on crash replies.
 const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 

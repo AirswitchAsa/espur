@@ -53,7 +53,7 @@ func (q *threadQueue) loop(ctx context.Context) {
 			// Run under a detached context so that signal-ctx cancellation
 			// (phase-1 shutdown) does not yank the in-flight invocation.
 			// The pool's per-invoke timeout still bounds it. See
-			// specs/shutdown.dog.md.
+			// docs/specs/shutdown.dog.md.
 			q.core.inflight.Add(1)
 			execCtx, cancel := q.core.execContext()
 			q.core.HandleTrigger(execCtx, m)

@@ -1,6 +1,6 @@
 // Package adapter defines the IM-platform port for the bot core. Each
 // concrete IM platform (Discord, WeChat, ...) lives in a sub-package and
-// implements the Adapter interface. See specs/adapter.dog.md.
+// implements the Adapter interface. See docs/specs/adapter.dog.md.
 package adapter
 
 import (

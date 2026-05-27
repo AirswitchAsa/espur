@@ -1,6 +1,6 @@
 // Package bot is the core orchestrator: dedup, per-thread queue with
 // burst-coalesce, dispatch to context-assembly → vendor pool → reply →
-// transcript. See specs/trigger.dog.md and specs/reply.dog.md.
+// transcript. See docs/specs/trigger.dog.md and docs/specs/reply.dog.md.
 package bot
 
 import (
@@ -39,7 +39,7 @@ type Core struct {
 
 	// Shutdown bookkeeping. inflight tracks how many HandleTrigger calls are
 	// currently running; stopped flips to true once shutdown begins and is
-	// used by Dispatch to reject new triggers. See specs/shutdown.dog.md.
+	// used by Dispatch to reject new triggers. See docs/specs/shutdown.dog.md.
 	inflight   sync.WaitGroup
 	stopped    atomic.Bool
 	hardCtx    context.Context

@@ -40,7 +40,7 @@ const DefaultMaxConcurrent = 4
 // Per-vendor penalty state can race in theory (two concurrent Runs both see
 // a vendor as eligible and both invoke it). The races are benign: PutPenalty
 // is a full-row upsert, so the worst case is FailureStreak over-counting by
-// one. Cooldown still fires correctly. See specs/vendor-pool.dog.md.
+// one. Cooldown still fires correctly. See docs/specs/vendor-pool.dog.md.
 type Pool struct {
 	db      *store.DB
 	vault   *secrets.Vault

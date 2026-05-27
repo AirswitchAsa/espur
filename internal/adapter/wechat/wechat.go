@@ -2,7 +2,7 @@
 // This is a *personal* WeChat session: it logs in by QR scan from a phone and
 // runs against the web/desktop WeChat protocol. Tencent has been known to
 // flag accounts that automate; the espur deploy doc warns operators. See
-// specs/adapter.dog.md for the abstract contract this satisfies.
+// docs/specs/adapter.dog.md for the abstract contract this satisfies.
 package wechat
 
 import (

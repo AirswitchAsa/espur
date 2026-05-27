@@ -1,5 +1,5 @@
 // Package vendor implements the vendor pool: selection, classified failure
-// detection, fallthrough, and the penalty box. See specs/vendor-pool.dog.md.
+// detection, fallthrough, and the penalty box. See docs/specs/vendor-pool.dog.md.
 package vendor
 
 import "strings"

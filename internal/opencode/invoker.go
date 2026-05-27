@@ -1,5 +1,5 @@
 // Package opencode invokes the `opencode` CLI as a stateless child process per
-// trigger. See specs/opencode-invoke.dog.md for the behavioral contract.
+// trigger. See docs/specs/opencode-invoke.dog.md for the behavioral contract.
 package opencode
 
 import (
@@ -26,7 +26,7 @@ const DefaultTimeout = 120 * time.Second
 const DefaultKillGrace = 5 * time.Second
 
 // Outcome enumerates the terminal categories defined in
-// specs/opencode-invoke.dog.md ("Outcome"). Vendor-fallthrough categories
+// docs/specs/opencode-invoke.dog.md ("Outcome"). Vendor-fallthrough categories
 // (rate-limit / quota / auth) are not yet classified — single-vendor slice.
 type Outcome int
 
@@ -51,7 +51,7 @@ func (o Outcome) String() string {
 }
 
 // Vendor is the concrete entry the pool yields per attempt. See
-// specs/vendor-pool.dog.md ("Outcome — A concrete (vendor_id, model,
+// docs/specs/vendor-pool.dog.md ("Outcome — A concrete (vendor_id, model,
 // credentials)…").
 type Vendor struct {
 	// VendorID is the stable identifier (e.g. "chatgpt-oauth").
@@ -199,7 +199,7 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 
 // buildEnv assembles the minimal env per spec: PATH, HOME, TMPDIR, plus the
 // vendor's credentials. The XDG_* variables are passed through too so that
-// opencode's own auth.json (used by OAuth providers — see specs/oauth.dog.md)
+// opencode's own auth.json (used by OAuth providers — see docs/specs/oauth.dog.md)
 // is resolved from a shared, persistent location across espur invocations
 // and `opencode auth login` runs. Espur's own master key and unrelated vendor
 // creds are deliberately excluded.

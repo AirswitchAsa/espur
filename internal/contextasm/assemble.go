@@ -1,4 +1,4 @@
-// Package contextasm implements specs/context-assembly.dog.md: build the
+// Package contextasm implements docs/specs/context-assembly.dog.md: build the
 // single user message handed to opencode, wrapping the transcript tail in
 // <thread-context> and the current trigger in <request>.
 package contextasm

@@ -1,5 +1,5 @@
-// Espur entrypoint. Boot sequence follows specs/bootstrap.dog.md;
-// termination follows specs/shutdown.dog.md.
+// Espur entrypoint. Boot sequence follows docs/specs/bootstrap.dog.md;
+// termination follows docs/specs/shutdown.dog.md.
 package main
 
 import (
@@ -26,7 +26,7 @@ import (
 	"github.com/punny/espur/internal/web"
 )
 
-// Exit codes per specs/shutdown.dog.md "Phase 3 — close resources."
+// Exit codes per docs/specs/shutdown.dog.md "Phase 3 — close resources."
 const (
 	exitOK            = 0
 	exitDrainExceeded = 1
@@ -52,7 +52,7 @@ func run() (int, error) {
 	// XDG_DATA_HOME governs where opencode reads/writes auth.json. We default
 	// it to a stable subdir of ESPUR_DATA_DIR so `opencode auth login` (run
 	// once via `docker exec`) persists tokens that espur's children pick up
-	// on subsequent invocations. See specs/oauth.dog.md.
+	// on subsequent invocations. See docs/specs/oauth.dog.md.
 	if os.Getenv("XDG_DATA_HOME") == "" {
 		_ = os.Setenv("XDG_DATA_HOME", filepath.Join(dataDir, "xdg-data"))
 	}
@@ -322,7 +322,7 @@ func newLogger(level string) *slog.Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
-	// JSON to stdout per specs/observability.dog.md ("all logs are written
+	// JSON to stdout per docs/specs/observability.dog.md ("all logs are written
 	// to stdout as structured records, one JSON object per line").
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 }

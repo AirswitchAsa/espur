@@ -1,5 +1,5 @@
 // Package secrets implements the at-rest credential encryption layer described
-// in specs/secrets.dog.md. Plaintext is encrypted with an age X25519 identity
+// in docs/specs/secrets.dog.md. Plaintext is encrypted with an age X25519 identity
 // loaded from the ESPUR_MASTER_KEY env var at boot.
 package secrets
 
@@ -66,7 +66,7 @@ func (v *Vault) Decrypt(ciphertext []byte) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
-// SelfTest implements the boot self-test from specs/secrets.dog.md:
+// SelfTest implements the boot self-test from docs/specs/secrets.dog.md:
 // pick any existing blob and verify it decrypts. Caller is responsible for
 // providing the blob (or nil, which is a "no blobs yet" valid state).
 func (v *Vault) SelfTest(blob []byte) error {

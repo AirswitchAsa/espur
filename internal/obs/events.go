@@ -1,5 +1,5 @@
 // Package obs holds the structured log event-name registry. Per
-// specs/observability.dog.md, every structured record carries an `event`
+// docs/specs/observability.dog.md, every structured record carries an `event`
 // attribute drawn from this list. New events may be added freely; renames
 // are a breaking change to log consumers.
 //

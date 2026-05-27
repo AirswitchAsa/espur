@@ -1,5 +1,5 @@
 // Package transcript implements the per-thread JSONL log described in
-// specs/transcript.dog.md.
+// docs/specs/transcript.dog.md.
 package transcript
 
 import (
@@ -75,7 +75,7 @@ func EncodeThreadID(raw string) string {
 }
 
 // Append writes one record to <threadDir>/transcript.jsonl, creating dirs.
-// Caller serializes writes per-thread (see specs/transcript.dog.md).
+// Caller serializes writes per-thread (see docs/specs/transcript.dog.md).
 func (s *Store) Append(platform, threadID string, r Record) error {
 	if r.TS == "" {
 		r.TS = time.Now().UTC().Format(time.RFC3339)

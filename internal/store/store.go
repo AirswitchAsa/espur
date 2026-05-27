@@ -1,5 +1,5 @@
 // Package store owns Espur's SQLite database: schema, migrations, and the
-// concrete queries other packages call. See specs/bootstrap.dog.md for the
+// concrete queries other packages call. See docs/specs/bootstrap.dog.md for the
 // "durable-state inventory" this file is the substrate for.
 package store
 
@@ -44,7 +44,7 @@ func (d *DB) Close() error { return d.sql.Close() }
 
 // Checkpoint forces a WAL checkpoint (TRUNCATE mode) so the database file
 // is fully self-contained. Used by the shutdown sequencer per
-// specs/shutdown.dog.md "Phase 3 — close resources." Safe to call repeatedly;
+// docs/specs/shutdown.dog.md "Phase 3 — close resources." Safe to call repeatedly;
 // returns an error which the operator usually wants to log at warn (the DB
 // is still consistent via WAL semantics even if checkpoint fails).
 func (d *DB) Checkpoint(ctx context.Context) error {

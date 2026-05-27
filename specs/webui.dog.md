@@ -8,7 +8,7 @@ The operator accesses Espur's admin web UI in a browser. The UI runs on a separa
 
 The web UI is scoped to operator administration. It does **not** expose end-user chat, per-thread settings panels, analytics dashboards, or a logs viewer (the host's log pipeline is the logs viewer).
 
-The UI is server-rendered (templ + htmx + Pico.css per the README); pages refresh by htmx swap, no JS build.
+The UI is server-rendered. v0.1 uses plain `html/template` plus the Pico.css classless CDN — no templ build, no htmx, no JS. Pages do a full reload on form submit. The README's old "templ + htmx" stack is a future-tense aspiration, not what ships. Forms `POST` and redirect (303) to a `GET` of the same listing page.
 
 **Pages / sections**
 
@@ -20,7 +20,7 @@ The UI is server-rendered (templ + htmx + Pico.css per the README); pages refres
      - **Enable / disable** toggle.
      - **Edit credentials** — opens the credential flow for that vendor type:
        - **BYO API key**: a single password field (`type="password"`), submitted over the UI's own connection, stored encrypted via the secrets layer. The current key is never echoed back to the browser; only `set` / `missing` is shown.
-       - **OAuth** (ChatGPT subscription, Claude subscription, anything else that uses an OAuth login): a "Connect" button that initiates the vendor's documented OAuth flow, returns to a callback handler on this same UI port, and persists the resulting tokens encrypted. Refresh-token rotation happens out of band; the UI shows `set` and the token's expiry if known.
+       - **OAuth**: Espur does not own the flow. The vendor row simply uses `cred_kind=oauth` and the operator authorises the matching provider via `opencode auth login` from a shell — see [[oauth]] and the `/oauth` status page below. There is no "Connect" button on the vendor row in v0.1.
      - **Clear penalty** — manually returns the vendor to `eligible` (resets streak, drops cooldown). For `auth_locked`, "Clear penalty" requires the operator to also re-save credentials in the same session, otherwise the vendor will re-lock on next attempt.
      - **Delete** — removes the vendor entry entirely (credentials wiped, history of penalty state discarded).
    - An **Add vendor** action appends a new entry to the bottom of the list with a chosen `vendor_id` template (`chatgpt-oauth`, `claude-oauth`, `gemini-api`, generic `byo-key`).
@@ -38,6 +38,15 @@ The UI is server-rendered (templ + htmx + Pico.css per the README); pages refres
 3. **Status / home**
    - A small landing page summarising: number of vendors (eligible / cooldown / auth-locked counts), number of threads, in-flight invocations, last error timestamp (if any).
    - Quick links to the Vendors and Threads pages.
+
+4. **OAuth providers** (`/oauth`)
+   - Read-only listing of providers configured in opencode's auth file: provider id, `type` (`api` / `oauth` / etc.), and whether a credential value is present. Token bytes are never displayed.
+   - Includes copy-pasteable `opencode auth login <provider>` and `docker exec` commands targeted at the running deploy's `XDG_DATA_HOME`, so the operator never has to look up the right path.
+   - This is the **only** OAuth surface in v0.1. See [[oauth]].
+
+5. **Health** (`/healthz`)
+   - Lightweight liveness JSON: `{ok, adapters:[{platform, healthy}]}`. 200 when every registered adapter is healthy; 503 (same body shape) otherwise.
+   - Intended for reverse-proxy / orchestrator probes; deploys SHOULD allow this path past upstream auth. See [[observability]].
 
 **What is explicitly out of scope**
 
@@ -66,7 +75,7 @@ After interacting with the UI:
 
 - TODO(decision): default UI port. README suggests `:8080`; confirm and document in deploy section.
 - TODO(decision): auth model. README says "HTTP basic auth or your own SSO" via the reverse proxy. Confirm Espur ships zero auth itself (no in-process basic-auth fallback); if any in-process auth is wanted, it must be specced separately.
-- TODO(decision): OAuth callback URL — does Espur own a fixed path (`/oauth/<vendor>/callback`) per vendor, or one shared callback that dispatches on state? Suggest per-vendor path for clarity; confirm.
+- OAuth callback URLs: not applicable. v0.1 delegates OAuth to opencode's own CLI per [[oauth]]; the admin port hosts no callback path.
 - TODO(decision): does the operator want a "test this vendor now" button on the vendor row (fires a canned `opencode run` against it and shows ok / error)? Useful but not in README. Out of scope for v0.1 unless confirmed.
 - TODO(decision): retention / hard-delete of a thread from the UI. README is silent and the threads page in this spec has no delete button. Confirm v0.1 deliberately omits it.
 - TODO(decision): exposing transcript / `AGENTS.md` in the UI is convenient for the operator but leaks user content to anyone who can reach the UI. Confirm the deployment-time assumption (reverse-proxy auth is mandatory).

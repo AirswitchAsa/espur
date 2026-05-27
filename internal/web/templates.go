@@ -24,6 +24,7 @@ const layout = `{{ define "layout" }}<!doctype html>
     <a href="/">status</a>
     <a href="/vendors">vendors</a>
     <a href="/threads">threads</a>
+    <a href="/oauth">oauth</a>
   </nav>
 </header>
 <main>
@@ -37,9 +38,48 @@ const layout = `{{ define "layout" }}<!doctype html>
 {{ else if eq .Page "vendors" }}{{ template "vendors" .Data }}
 {{ else if eq .Page "threads" }}{{ template "threads" .Data }}
 {{ else if eq .Page "thread_detail" }}{{ template "thread_detail" .Data }}
+{{ else if eq .Page "oauth" }}{{ template "oauth" .Data }}
 {{ end }}
 {{ end }}
 `
+
+const oauthTpl = `{{ define "oauth" }}
+<h2>OAuth providers</h2>
+<p class="muted">
+  Espur delegates OAuth to the bundled <code>opencode</code> CLI. Run the
+  command below inside the container (or your dev shell) to authorise a
+  provider; the resulting token bundle lands in
+  <code>{{ .AuthPath }}</code> and Espur's child invocations pick it up
+  automatically. No state is stored in Espur for OAuth vendors beyond the
+  vendor row itself — revoke or re-auth via the same CLI.
+</p>
+
+<h3>Configured providers</h3>
+<table>
+  <thead><tr><th>provider</th><th>type</th><th>credential present</th></tr></thead>
+  <tbody>
+  {{ range .Entries }}
+  <tr>
+    <td><code>{{ .Provider }}</code></td>
+    <td>{{ .Type }}</td>
+    <td>{{ if .HasKey }}yes{{ else }}<span class="muted">no</span>{{ end }}</td>
+  </tr>
+  {{ else }}
+  <tr><td colspan="3" class="muted">no providers configured yet</td></tr>
+  {{ end }}
+  </tbody>
+</table>
+
+<h3>How to authorise</h3>
+<p>From your terminal (replace <code>&lt;provider&gt;</code> with e.g.
+<code>anthropic</code>, <code>openai</code>, or whichever opencode supports):</p>
+<pre>docker exec -it &lt;container&gt; opencode auth login &lt;provider&gt;</pre>
+<p>For a local dev run (auth.json shared via <code>XDG_DATA_HOME</code>):</p>
+<pre>XDG_DATA_HOME={{ .XDGHome }} opencode auth login &lt;provider&gt;</pre>
+<p>After authorising, refresh this page. Vendors in the table on the
+<a href="/vendors">vendors</a> page that reference the same provider
+will use the freshly stored credential on their next invocation.</p>
+{{ end }}`
 
 const homeTpl = `{{ define "home" }}
 <h2>Status</h2>

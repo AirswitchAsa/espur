@@ -7,11 +7,13 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/punny/espur/internal/adapter"
 	"github.com/punny/espur/internal/contextasm"
 	"github.com/punny/espur/internal/memory"
+	"github.com/punny/espur/internal/obs"
 	"github.com/punny/espur/internal/store"
 	"github.com/punny/espur/internal/transcript"
 	"github.com/punny/espur/internal/vendor"
@@ -34,6 +36,14 @@ type Core struct {
 	mu      sync.Mutex
 	queues  map[string]*threadQueue    // keyed by "<platform>:<thread_id>"
 	posters map[string]adapter.Adapter // platform → adapter for outbound Post
+
+	// Shutdown bookkeeping. inflight tracks how many HandleTrigger calls are
+	// currently running; stopped flips to true once shutdown begins and is
+	// used by Dispatch to reject new triggers. See specs/shutdown.dog.md.
+	inflight   sync.WaitGroup
+	stopped    atomic.Bool
+	hardCtx    context.Context
+	hardCancel context.CancelFunc
 }
 
 // New constructs a Core. Register adapters with RegisterAdapter before Run.
@@ -70,13 +80,74 @@ func (c *Core) Dispatch(ctx context.Context, ev adapter.Event) {
 	case ev.Message != nil:
 		c.onMessage(ctx, ev.Message)
 	case ev.Lifecycle != nil:
+		evName := obs.AdapterLifecycle
+		switch ev.Lifecycle.Kind {
+		case adapter.LifecycleConnected:
+			evName = obs.AdapterConnected
+		case adapter.LifecycleDisconnected:
+			evName = obs.AdapterDisconnected
+		case adapter.LifecycleReconnecting:
+			evName = obs.AdapterReconnecting
+		}
 		c.cfg.Logger.Info("adapter lifecycle",
+			"event", evName,
 			"platform", ev.Lifecycle.Platform, "kind", ev.Lifecycle.Kind,
 			"cause", ev.Lifecycle.Cause, "attempt", ev.Lifecycle.Attempt)
 	}
 }
 
+// execContext returns a context detached from the signal-cancellation tree.
+// In-flight invocations should outlive a first SIGTERM (per shutdown.dog.md);
+// they're bounded by the per-invoke opencode timeout instead. The parent
+// is c.hardCtx (lazily initialised) so that AbortInFlight can yank every
+// running invocation at once on second-signal escalation.
+func (c *Core) execContext() (context.Context, context.CancelFunc) {
+	c.mu.Lock()
+	if c.hardCtx == nil {
+		c.hardCtx, c.hardCancel = context.WithCancel(context.Background())
+	}
+	parent := c.hardCtx
+	c.mu.Unlock()
+	return context.WithCancel(parent)
+}
+
+// AbortInFlight cancels every in-flight HandleTrigger invocation. Used by the
+// shutdown sequencer on a second termination signal or after the drain
+// deadline lapses. Idempotent.
+func (c *Core) AbortInFlight() {
+	c.mu.Lock()
+	cancel := c.hardCancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// StopAccepting marks the core as draining: Dispatch will reject new
+// triggers, but in-flight HandleTrigger calls keep running until WaitDrain
+// returns. Idempotent.
+func (c *Core) StopAccepting() { c.stopped.Store(true) }
+
+// WaitDrain blocks until all in-flight HandleTrigger calls complete or ctx
+// expires. Returns true if the drain finished cleanly, false on deadline.
+func (c *Core) WaitDrain(ctx context.Context) bool {
+	done := make(chan struct{})
+	go func() { c.inflight.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func (c *Core) onMessage(ctx context.Context, m *adapter.MessageEvent) {
+	if c.stopped.Load() {
+		// Phase 1 of shutdown: no new triggers, but adapters may still hand
+		// us events from buffered channels. Drop silently — the platform's
+		// retry on the next boot will dedupe against the table.
+		return
+	}
 	// Dedup first (spec: trigger.dog.md). Dedup applies regardless of whether
 	// the message mentions the bot — non-mention messages still get appended
 	// to the transcript.
@@ -104,8 +175,15 @@ func (c *Core) onMessage(ctx context.Context, m *adapter.MessageEvent) {
 		return
 	}
 	if !m.Mention {
+		c.cfg.Logger.Debug("non-mention observed",
+			"event", obs.TriggerObserved,
+			"platform", m.Platform, "thread_id", m.ThreadID)
 		return // observed-only; no trigger.
 	}
+	c.cfg.Logger.Info("trigger accepted",
+		"event", obs.TriggerAccepted,
+		"platform", m.Platform, "thread_id", m.ThreadID,
+		"message_id", m.PlatformMessageID)
 
 	// Enqueue / coalesce.
 	key := m.Platform + ":" + m.ThreadID
@@ -175,21 +253,39 @@ func (c *Core) HandleTrigger(ctx context.Context, m *adapter.MessageEvent) {
 
 	switch res.Outcome {
 	case vendor.OutcomeSuccess:
+		c.cfg.Logger.Info("invocation success",
+			"event", obs.InvocationSuccess,
+			"platform", m.Platform, "thread_id", m.ThreadID,
+			"vendor_id", res.VendorID, "attempts", len(res.Attempts))
 		pid, perr := a.Post(ctx, m.ThreadID, res.Text)
 		c.appendBotReply(m, pid, res.Text, "success", "", res.VendorID, perr)
 
 	case vendor.OutcomeTimeout:
+		rid := NewRequestID()
+		c.cfg.Logger.Error("invocation timeout",
+			"event", obs.InvocationTimeout,
+			"request_id", rid,
+			"platform", m.Platform, "thread_id", m.ThreadID,
+			"vendor_id", res.VendorID)
 		pid, perr := a.Post(ctx, m.ThreadID, TimeoutReply)
-		c.appendBotReply(m, pid, TimeoutReply, "timeout", "", res.VendorID, perr)
+		c.appendBotReply(m, pid, TimeoutReply, "timeout", rid, res.VendorID, perr)
 
 	case vendor.OutcomeAllDrained:
+		rid := NewRequestID()
+		c.cfg.Logger.Error("all vendors drained",
+			"event", obs.InvocationAllDrained,
+			"request_id", rid,
+			"platform", m.Platform, "thread_id", m.ThreadID,
+			"penalized", len(res.Penalized))
 		body := DrainedReply(res.Penalized, c.cfg.DashboardURL, time.Now())
 		pid, perr := a.Post(ctx, m.ThreadID, body)
-		c.appendBotReply(m, pid, body, "drained", "", "", perr)
+		c.appendBotReply(m, pid, body, "drained", rid, "", perr)
 
 	case vendor.OutcomeCrash:
 		rid := NewRequestID()
-		c.cfg.Logger.Error("crash reply", "request_id", rid, "vendor_id", res.VendorID,
+		c.cfg.Logger.Error("invocation crash",
+			"event", obs.InvocationCrash,
+			"request_id", rid, "vendor_id", res.VendorID,
 			"reason", res.CrashReason, "attempts", len(res.Attempts))
 		body := CrashReply(rid)
 		pid, perr := a.Post(ctx, m.ThreadID, body)
@@ -206,7 +302,10 @@ func (c *Core) postCrash(ctx context.Context, m *adapter.MessageEvent, reason st
 		return
 	}
 	rid := NewRequestID()
-	c.cfg.Logger.Error("crash reply", "request_id", rid, "reason", reason)
+	c.cfg.Logger.Error("crash reply",
+		"event", obs.InvocationCrash,
+		"request_id", rid, "reason", reason,
+		"platform", m.Platform, "thread_id", m.ThreadID)
 	body := CrashReply(rid)
 	pid, perr := a.Post(ctx, m.ThreadID, body)
 	c.appendBotReply(m, pid, body, "crash", rid, "", perr)
@@ -214,7 +313,10 @@ func (c *Core) postCrash(ctx context.Context, m *adapter.MessageEvent, reason st
 
 func (c *Core) appendBotReply(m *adapter.MessageEvent, platformMsgID, body, outcome, reqID, vendorID string, postErr error) {
 	if postErr != nil {
-		c.cfg.Logger.Error("adapter post failed", "err", postErr, "outcome", outcome)
+		c.cfg.Logger.Error("adapter post failed",
+			"event", obs.AdapterPostFailed,
+			"platform", m.Platform, "thread_id", m.ThreadID,
+			"outcome", outcome, "request_id", reqID, "err", postErr.Error())
 		// Per spec: if no chunk was posted at all, write a system "previous
 		// turn aborted" line so the next invocation sees the gap.
 		if platformMsgID == "" {

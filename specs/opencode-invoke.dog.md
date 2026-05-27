@@ -27,7 +27,9 @@ opencode run --format json --model <vendor-model-id>
 
 **Environment**
 
-- The minimal env passed to the child: `PATH`, `HOME`, `TMPDIR`, and the vendor's credentials in the form opencode expects (API keys via env vars; OAuth tokens via opencode's auth file mechanism for that vendor).
+- The minimal env passed to the child: `PATH`, `HOME`, `TMPDIR`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, and the vendor's credentials in the form opencode expects.
+  - For BYO-key vendors that is one or more API-key env vars (e.g. `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`).
+  - For OAuth vendors, **no provider-specific env var is injected**. The credential lives in opencode's auth file under `$XDG_DATA_HOME/opencode/auth.json` and is read by opencode itself — see [[oauth]] for the delegation model.
 - Espur does **not** leak its own master key or unrelated vendor credentials into the child env. Only the credentials of the vendor currently being attempted are exposed.
 
 **Timeout**

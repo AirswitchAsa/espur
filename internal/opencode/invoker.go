@@ -198,11 +198,14 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 }
 
 // buildEnv assembles the minimal env per spec: PATH, HOME, TMPDIR, plus the
-// vendor's credentials. Espur's own master key and unrelated vendor creds are
-// deliberately excluded.
+// vendor's credentials. The XDG_* variables are passed through too so that
+// opencode's own auth.json (used by OAuth providers — see specs/oauth.dog.md)
+// is resolved from a shared, persistent location across espur invocations
+// and `opencode auth login` runs. Espur's own master key and unrelated vendor
+// creds are deliberately excluded.
 func buildEnv(creds map[string]string) []string {
-	out := make([]string, 0, 3+len(creds))
-	for _, k := range []string{"PATH", "HOME", "TMPDIR"} {
+	out := make([]string, 0, 6+len(creds))
+	for _, k := range []string{"PATH", "HOME", "TMPDIR", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"} {
 		if v, ok := os.LookupEnv(k); ok {
 			out = append(out, k+"="+v)
 		}
@@ -264,6 +267,8 @@ type ocExport struct {
 
 func exportAssistantText(ctx context.Context, bin, sessionID string) (string, error) {
 	cmd := exec.CommandContext(ctx, bin, "export", sessionID)
+	// Match the run env so auth.json + XDG resolution is consistent.
+	cmd.Env = buildEnv(nil)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

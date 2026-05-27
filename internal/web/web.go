@@ -16,19 +16,29 @@ import (
 	"strings"
 	"time"
 
+	"github.com/punny/espur/internal/opencode"
 	"github.com/punny/espur/internal/secrets"
 	"github.com/punny/espur/internal/store"
 	"github.com/punny/espur/internal/transcript"
 	"github.com/punny/espur/internal/vendor"
 )
 
+// AdapterHealth is the minimal contract /healthz needs to report per-adapter
+// liveness. Implemented by every internal/adapter.Adapter (Platform + Healthy)
+// so we don't have to import the adapter package here.
+type AdapterHealth interface {
+	Platform() string
+	Healthy() bool
+}
+
 // Server is the admin UI HTTP server.
 type Server struct {
-	db    *store.DB
-	vault *secrets.Vault
-	pool  *vendor.Pool
-	ts    *transcript.Store
-	tmpl  *template.Template
+	db       *store.DB
+	vault    *secrets.Vault
+	pool     *vendor.Pool
+	ts       *transcript.Store
+	tmpl     *template.Template
+	adapters []AdapterHealth // for /healthz
 }
 
 // New wires the admin server. No auth — relies on reverse-proxy auth per spec.
@@ -62,12 +72,20 @@ func New(db *store.DB, vault *secrets.Vault, pool *vendor.Pool, ts *transcript.S
 	template.Must(s.tmpl.Parse(vendorsTpl))
 	template.Must(s.tmpl.Parse(threadsTpl))
 	template.Must(s.tmpl.Parse(threadDetailTpl))
+	template.Must(s.tmpl.Parse(oauthTpl))
 	return s
+}
+
+// RegisterAdapter wires an adapter into /healthz reporting. Safe to call
+// at boot only — not thread-safe.
+func (s *Server) RegisterAdapter(a AdapterHealth) {
+	s.adapters = append(s.adapters, a)
 }
 
 // Handler returns the http.Handler to mount on the admin port.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /{$}", s.home)
 	mux.HandleFunc("GET /vendors", s.vendorsList)
 	mux.HandleFunc("POST /vendors/add", s.vendorAdd)
@@ -76,6 +94,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /vendors/{id}/delete", s.vendorDelete)
 	mux.HandleFunc("POST /vendors/{id}/clear-penalty", s.vendorClearPenalty)
 	mux.HandleFunc("POST /vendors/reorder", s.vendorsReorder)
+	mux.HandleFunc("GET /oauth", s.oauthPage)
 	mux.HandleFunc("GET /threads", s.threads)
 	mux.HandleFunc("GET /threads/{platform}/{enc_id}", s.threadDetail)
 	return mux
@@ -330,6 +349,25 @@ func (s *Server) listThreads() []threadRow {
 
 func (s *Server) threads(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "threads", s.listThreads())
+}
+
+// oauthPage shows the OAuth providers configured via `opencode auth login`.
+// Espur does not own the flow; this is a read-only status surface.
+func (s *Server) oauthPage(w http.ResponseWriter, _ *http.Request) {
+	entries, err := opencode.ReadAuthEntries()
+	if err != nil {
+		http.Error(w, "read auth.json: "+err.Error(), 500)
+		return
+	}
+	s.render(w, "oauth", struct {
+		Entries  []opencode.AuthEntry
+		AuthPath string
+		XDGHome  string
+	}{
+		Entries:  entries,
+		AuthPath: opencode.AuthFilePath(),
+		XDGHome:  os.Getenv("XDG_DATA_HOME"),
+	})
 }
 
 type threadDetailPage struct {

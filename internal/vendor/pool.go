@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
 
+	"github.com/punny/espur/internal/obs"
 	"github.com/punny/espur/internal/opencode"
 	"github.com/punny/espur/internal/secrets"
 	"github.com/punny/espur/internal/store"
@@ -35,6 +37,7 @@ type Pool struct {
 	invoker Invoker
 	now     func() time.Time
 	rng     *rand.Rand
+	logger  *slog.Logger
 }
 
 // New constructs a pool with the real opencode invoker and default clock.
@@ -45,7 +48,16 @@ func New(db *store.DB, vault *secrets.Vault) *Pool {
 		invoker: realInvoker{},
 		now:     time.Now,
 		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		logger:  slog.Default(),
 	}
+}
+
+// WithLogger swaps the logger used for vendor-pool transitions.
+func (p *Pool) WithLogger(l *slog.Logger) *Pool {
+	if l != nil {
+		p.logger = l
+	}
+	return p
 }
 
 // WithInvoker swaps the invoker (used by tests). Returns p for chaining.
@@ -170,6 +182,11 @@ func (p *Pool) Run(ctx context.Context, workDir, userMsg string, timeout time.Du
 		switch ocRes.Outcome {
 		case opencode.OutcomeSuccess:
 			// Spec: success resets streak + status.
+			if pen.Status != store.PenaltyEligible || pen.FailureStreak > 0 {
+				p.logger.Info("vendor recovered",
+					"event", obs.VendorRecovered,
+					"vendor_id", v.VendorID, "prior_streak", pen.FailureStreak)
+			}
 			_ = p.db.PutPenalty(ctx, applySuccess(pen, p.now()))
 			att.Class = ClassNone
 			res.Attempts = append(res.Attempts, att)
@@ -202,6 +219,21 @@ func (p *Pool) Run(ctx context.Context, workDir, userMsg string, timeout time.Du
 			updated := applyFailure(pen, class, p.now(), p.rng)
 			if err := p.db.PutPenalty(ctx, updated); err != nil {
 				return res, err
+			}
+			if updated.Status == store.PenaltyAuthLocked {
+				p.logger.Warn("vendor auth locked",
+					"event", obs.VendorAuthLocked,
+					"vendor_id", v.VendorID, "failure_class", class.String())
+			} else if updated.Status == store.PenaltyCooldown {
+				cooldownUntil := ""
+				if updated.CooldownUntil != nil {
+					cooldownUntil = updated.CooldownUntil.UTC().Format(time.RFC3339)
+				}
+				p.logger.Info("vendor entered cooldown",
+					"event", obs.VendorCooldownEntered,
+					"vendor_id", v.VendorID, "failure_class", class.String(),
+					"failure_streak", updated.FailureStreak,
+					"cooldown_until", cooldownUntil)
 			}
 			res.Penalized = append(res.Penalized, PenalizedSnapshot{
 				VendorID: v.VendorID, Status: updated.Status, CooldownUntil: updated.CooldownUntil,

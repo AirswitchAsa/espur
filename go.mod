@@ -7,6 +7,7 @@ require (
 	filippo.io/hpke v0.4.0 // indirect
 	github.com/bwmarrin/discordgo v0.29.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/eatmoreapple/openwechat v1.4.10 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.4.2 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

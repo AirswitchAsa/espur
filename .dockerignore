@@ -1,0 +1,15 @@
+.git
+.gitignore
+.dockerignore
+README.md
+LICENSE
+data/
+*.db
+*.db-*
+.env
+.env.*
+.vscode
+.idea
+.DS_Store
+tmp/
+bin/

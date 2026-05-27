@@ -14,6 +14,20 @@ const (
 	ClassAuth                          // 401/403 / clear auth-phrase — auth_locked
 )
 
+// String renders the class for logs (used as the failure_class attribute).
+func (c FailureClass) String() string {
+	switch c {
+	case ClassRateLimit:
+		return "rate_limit"
+	case ClassServer5xx:
+		return "server_5xx"
+	case ClassAuth:
+		return "auth"
+	default:
+		return "none"
+	}
+}
+
 // rateLimitPhrases are case-insensitive substrings cribbed from the
 // opencode-rate-limit-fallback plugin and the spec text. Lives in code, not
 // in the spec (the spec fixes the categories; patterns can evolve).

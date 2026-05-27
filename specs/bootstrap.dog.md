@@ -8,7 +8,17 @@ The Espur binary is started by the operator (directly, via `air` in dev, or as a
 
 **Configuration sources, in precedence order.**
 
-1. **Environment variables** — for operational knobs that must be settable per-deploy without UI access: `ESPUR_MASTER_KEY` (age identity, required), `ESPUR_DATA_DIR` (default `./data`), `ESPUR_WEB_PORT` (default `8080`), `ESPUR_LOG_LEVEL` (default `info`), `ESPUR_DASHBOARD_URL` (used in [[reply]]'s drained message), `ESPUR_OPENCODE_TIMEOUT` (default `120s`), per-vendor OAuth client credentials per [[oauth]].
+1. **Environment variables** — for operational knobs that must be settable per-deploy without UI access:
+   - `ESPUR_MASTER_KEY` (age identity, required)
+   - `ESPUR_DATA_DIR` (default `./data`)
+   - `ESPUR_WEB_PORT` (default `8080`)
+   - `ESPUR_LOG_LEVEL` (`debug`/`info`/`warn`/`error`, default `info`)
+   - `ESPUR_DASHBOARD_URL` (used in [[reply]]'s drained message)
+   - `ESPUR_OPENCODE_TIMEOUT` (default `120s`)
+   - `ESPUR_SHUTDOWN_DRAIN` (phase-2 drain deadline; default `30s`, floored to `ESPUR_OPENCODE_TIMEOUT` so an in-flight invocation always gets one full attempt window — see [[shutdown]])
+   - `ESPUR_DISCORD_TOKEN` (presence enables the Discord adapter)
+   - `ESPUR_WECHAT_ENABLED` (`1`/`true` opts into the personal-WeChat adapter; QR-login flow per [[adapter]])
+   - `XDG_DATA_HOME` (defaults to `$ESPUR_DATA_DIR/xdg-data` if unset; opencode reads its auth file from `$XDG_DATA_HOME/opencode/auth.json`, so this is the shared anchor between `opencode auth login` and Espur's child invocations — see [[oauth]])
 2. **SQLite-persisted state** — vendor list + priority, encrypted credentials, penalty-box state, dedup table. Owned by the web UI at runtime; not editable via env.
 3. **Compiled-in defaults** — for anything not set by 1 or 2: transcript-tail N, failure-classification patterns, retry/backoff constants, chunking rules, seed-AGENTS.md template, etc.
 
@@ -32,7 +42,9 @@ Boot is considered successful once steps 1–7 complete; steps 8–9 are best-ef
 
 The complete set of state that survives a restart:
 
-- `data/espur.db` (SQLite): vendor list + priority, encrypted credentials + metadata, penalty-box state per vendor, pending OAuth `state` rows, message-ID dedup table per platform, any future operator-facing tables.
+- `data/espur.db` (SQLite): vendor list + priority, encrypted credentials + metadata (BYO API keys), penalty-box state per vendor, message-ID dedup table per platform, any future operator-facing tables.
+- `$XDG_DATA_HOME/opencode/auth.json` (under `data/xdg-data/` by default): opencode's own auth file holding OAuth bundles. Owned and rotated by `opencode auth login` — see [[oauth]]. Espur reads it for `/oauth` display only.
+- `data/wechat-session.json` (optional, present only when [[adapter]] WeChat is enabled): openwechat hot-reload session blob so subsequent boots skip the QR-login step.
 - `data/threads/<platform>/<encoded_id>/`: per-thread working directory containing `AGENTS.md`, any `fact_*.md` opencode wrote, the `transcript.jsonl`, and any opencode-side scratch.
 
 Everything else is process-local and recomputed at boot:

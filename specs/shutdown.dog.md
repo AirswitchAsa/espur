@@ -20,7 +20,7 @@ After this phase, no new triggers enter any per-thread queue.
 
 **Phase 2 — finish what's in flight.**
 
-- Each per-thread queue has at most one in-flight invocation (per [[trigger]]) and at most one coalesced-waiting trigger. Shutdown waits for the **in-flight** invocation to complete, up to a hard drain deadline (default 30s, capped at the larger of `ESPUR_OPENCODE_TIMEOUT` and 30s).
+- Each per-thread queue has at most one in-flight invocation (per [[trigger]]) and at most one coalesced-waiting trigger. Shutdown waits for the **in-flight** invocation to complete, up to a hard drain deadline. The deadline is controlled by `ESPUR_SHUTDOWN_DRAIN` (default 30s) and is floored at `ESPUR_OPENCODE_TIMEOUT` so that whatever timeout the operator picked for one attempt always has room to finish.
 - Coalesced-waiting triggers are **not** started. They remain on disk only via the dedup table — they were accepted at the IM platform level (and recorded in [[transcript]]) but produce no reply on this run. Their `platform_message_id`s remain in the dedup table, so a future user resend is deduped to a no-op. This matches the known minor gap acknowledged in [[adapter]].
 - If the drain deadline expires with an invocation still running, the opencode child is killed with `SIGTERM` then `SIGKILL` after a short grace, exactly as in [[opencode-invoke]]'s timeout path. The user-visible reply for that trigger is not posted; a [[transcript]] `kind=system` record with `note=shutdown-aborted-turn` is appended.
 - Adapters' outbound `Post` calls that are mid-retry honour the same root context cancellation: they return `ctx.Err()` and the caller handles per [[adapter]]'s "ctx cancelled" path.
@@ -60,7 +60,7 @@ A subsequent boot per [[bootstrap]] resumes from durable state with no knowledge
 
 ## Notes
 
-- TODO(decision): default drain deadline of 30s — confirm this matches container rollout grace windows typically configured by operators (Kubernetes `terminationGracePeriodSeconds` defaults to 30s, Fly to 5s with override). Suggest expose as `ESPUR_SHUTDOWN_DRAIN` env override; confirm.
+- Default drain deadline of 30s, overridable via `ESPUR_SHUTDOWN_DRAIN`, with a runtime floor at `ESPUR_OPENCODE_TIMEOUT`. The floor exists because shipping a drain shorter than the per-invocation timeout makes every in-flight invocation a guaranteed abort. Operators with shorter container grace windows (e.g. Fly's 5s default) should either accept the abort rate or extend the platform grace window to match.
 - TODO(decision): should phase-2 actually drain coalesced-waiting triggers (give them their one shot) instead of dropping them? Suggest no — they were never started, and starting work after the shutdown signal violates the "no new work" contract. Confirm.
 - The deliberate decision to not serialize in-flight state to disk is a simplicity bet. The alternative (persistent queue + resume) is implementable later if real usage shows the dropped-turn rate is bad.
 - Shutdown does not attempt to rotate or delete OAuth tokens or any other secret. Whatever was encrypted at rest stays as it was.

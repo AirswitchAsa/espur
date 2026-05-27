@@ -42,6 +42,16 @@ type DB struct{ sql *sql.DB }
 
 func (d *DB) Close() error { return d.sql.Close() }
 
+// Checkpoint forces a WAL checkpoint (TRUNCATE mode) so the database file
+// is fully self-contained. Used by the shutdown sequencer per
+// specs/shutdown.dog.md "Phase 3 — close resources." Safe to call repeatedly;
+// returns an error which the operator usually wants to log at warn (the DB
+// is still consistent via WAL semantics even if checkpoint fails).
+func (d *DB) Checkpoint(ctx context.Context) error {
+	_, err := d.sql.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE);`)
+	return err
+}
+
 // SQL exposes the raw handle for tests that need it; ordinary callers use
 // the typed methods below.
 func (d *DB) SQL() *sql.DB { return d.sql }

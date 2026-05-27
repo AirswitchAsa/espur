@@ -118,13 +118,13 @@ If a design doc and a DOG spec disagree, the DOG spec wins. Design docs are scra
 | Layer | Choice | Why |
 | ----- | ------ | --- |
 | Language | Go 1.23+ | Single binary, fast startup, great stdlib for HTTP + sqlite |
-| Web UI | [templ](https://templ.guide) + [htmx](https://htmx.org) + [Pico.css](https://picocss.com) | Typed components, no JS build, semantic CSS |
+| Web UI | `html/template` + [Pico.css](https://picocss.com) (classless, via CDN) | Deliberately minimal in v0.1 — no JS build, no htmx, no templ. Forms POST and 303-redirect. |
 | Storage | SQLite via [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) | Pure-Go driver, no CGo, one file on disk |
-| Secrets | [age](https://github.com/FiloSottile/age) for column-level encryption | Master key from env var at boot |
+| Secrets | [age](https://github.com/FiloSottile/age) for column-level encryption | Master key from env var at boot. OAuth credentials are not stored by Espur — see "OAuth" below. |
 | Agent runtime | opencode CLI (`opencode run --format json --model …`) | Stateless invocation per trigger |
-| IM adapters | One package per platform under `internal/adapter/` | Discord first, WeChat second |
-| Testing | stdlib `testing` + [`testify/require`](https://github.com/stretchr/testify) | Boring |
-| Build | `go build`, Dockerfile, `air` for dev hot-reload | No Make heroics |
+| IM adapters | One package per platform under `internal/adapter/` | Discord (gateway) + WeChat personal via [openwechat](https://github.com/eatmoreapple/openwechat) (QR-login) |
+| Testing | stdlib `testing` | Boring |
+| Build | `go build` + multi-stage Dockerfile | No Make heroics |
 
 ### 3. Repo organization
 
@@ -166,15 +166,15 @@ espur/
 ```bash
 # one-time
 go mod tidy
-templ generate
-go run ./cmd/espur
 
-# dev loop (hot reload)
+# generate a master key (run once, paste into .env or your shell)
+go run ./cmd/espur-genkey
+
+# run (reads .env if present)
 ./scripts/dev.sh
 
 # specs
-dog check
-dog list
+dog lint specs
 
 # tests + lint
 go test ./...
@@ -182,28 +182,69 @@ go vet ./...
 gofmt -l .  # should print nothing
 ```
 
+`.env` minimal example:
+
+```env
+ESPUR_MASTER_KEY=AGE-SECRET-KEY-1...   # from espur-genkey
+ESPUR_LOG_LEVEL=debug
+# optional adapters:
+# ESPUR_DISCORD_TOKEN=...
+# ESPUR_WECHAT_ENABLED=1
+```
+
 ### 5. Deploy
 
-Single Docker container. Mount a volume at `/data` for SQLite + thread working dirs. Pass `ESPUR_MASTER_KEY` (age recipient/identity) as an env var. Expose:
+Single Docker container (multi-stage build: Go binary on a Node 20 Alpine runtime that has `opencode-ai` pre-installed). Mount a volume at `/data` for SQLite, thread working dirs, opencode's auth file, and the WeChat hot-reload session. Pass `ESPUR_MASTER_KEY` (age identity) as an env var. The container ships with `XDG_DATA_HOME=/data/xdg-data` and `HOME=/data` so `opencode auth login` and Espur's children share one auth file.
 
-- IM adapter ports as required (most are outbound webhook polls, no inbound).
-- Web UI port (default `:8080`), put behind a reverse proxy with HTTP basic auth or your own SSO.
+Build + run:
 
-Recommended: a small EC2 / Fly / Hetzner box. The container *is* the sandbox.
+```bash
+docker build -t espur .
+docker run -d --name espur \
+  -v espur-data:/data \
+  -e ESPUR_MASTER_KEY=AGE-SECRET-KEY-1... \
+  -e ESPUR_DISCORD_TOKEN=... \
+  -p 8080:8080 \
+  espur
+```
+
+Expose:
+
+- IM adapter ports as required (Discord is outbound gateway, no inbound; WeChat is QR-login + long-poll, no inbound).
+- Web UI port (default `:8080`) **behind a reverse proxy with HTTP basic auth or your own SSO**. Allow `GET /healthz` past auth for orchestrator probes; the rest of `/` is operator-only.
+
+OAuth bring-up (one-time per provider — see `specs/oauth.dog.md`):
+
+```bash
+docker exec -it espur opencode auth login anthropic
+# or: openai, copilot, ... whichever opencode supports
+```
+
+Graceful shutdown is the responsibility of the container runtime sending `SIGTERM`. Espur drains in-flight invocations for up to `ESPUR_SHUTDOWN_DRAIN` (default 30s, floored to `ESPUR_OPENCODE_TIMEOUT`) before forcing a hard cancel. Set Kubernetes `terminationGracePeriodSeconds` (or your platform's equivalent) to at least that value.
+
+Recommended host: a small EC2 / Fly / Hetzner box. The container *is* the sandbox.
 
 ### 6. Order to build things in
 
-1. **Specs for the trigger flow** in `specs/` — adapter → queue → context assembly → opencode invoke → reply.
-2. **opencode invoker + vendor pool** — the riskiest unknown. Get a one-vendor invocation working end-to-end from a Go test before adding fallback or adapters.
-3. **SQLite store + secrets** — needed by the web UI and the vendor pool.
-4. **Discord adapter** — the simplest IM platform with the best dev ergonomics.
-5. **Transcript + context assembly** — wire the assembled prompt into the invoker.
-6. **Memory seed** — drop a seed `AGENTS.md` into new thread working dirs.
-7. **Web UI** — vendor config, OAuth flows, thread list.
-8. **WeChat adapter** — second platform, validates that adapter abstraction holds.
-9. **Penalty box persistence + cooldown logic** — only once you've actually hit a rate limit in real use.
+1. ✅ **Specs for the trigger flow** in `specs/` — adapter → queue → context assembly → opencode invoke → reply.
+2. ✅ **opencode invoker + vendor pool** — the riskiest unknown. One-vendor invocation working end-to-end from a Go test.
+3. ✅ **SQLite store + secrets** — needed by the web UI and the vendor pool.
+4. ✅ **Discord adapter**.
+5. ✅ **Transcript + context assembly**.
+6. ✅ **Memory seed**.
+7. ✅ **Web UI** — vendor config, thread list, OAuth status. (OAuth flows themselves are delegated to `opencode auth login`; see `specs/oauth.dog.md`.)
+8. ✅ **WeChat adapter** — personal account via [openwechat](https://github.com/eatmoreapple/openwechat); opt-in via `ESPUR_WECHAT_ENABLED=1`.
+9. ✅ **Penalty box** — exponential backoff with jitter, auth-locked permanent state.
+10. ✅ **Graceful shutdown + observability** — phase-ordered drain, JSON logs to stdout with stable `event=` names, `/healthz`.
 
-Each step ships behind a spec. Each step gets a `dog check` pass before moving on.
+Not yet shipped (would push past v0.1):
+
+- Real-world OAuth smoke against a live provider account.
+- Real-world WeChat smoke against an actual QR-login session.
+- Global per-process concurrency cap on opencode children.
+- Per-thread / per-vendor "test now" affordances in the UI.
+
+Each step ships behind a spec. Each step gets a `dog lint specs` pass before moving on.
 
 ---
 

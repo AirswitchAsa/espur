@@ -64,6 +64,55 @@ func TestAddVendor_ThenList(t *testing.T) {
 	}
 }
 
+type fakeAdapter struct {
+	platform string
+	healthy  bool
+}
+
+func (f fakeAdapter) Platform() string { return f.platform }
+func (f fakeAdapter) Healthy() bool    { return f.healthy }
+
+func TestHealthz_AllUp(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.RegisterAdapter(fakeAdapter{"discord", true})
+	s.RegisterAdapter(fakeAdapter{"wechat", true})
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":true`) ||
+		!strings.Contains(rec.Body.String(), `"platform":"discord"`) {
+		t.Fatalf("body=%s", rec.Body.String())
+	}
+}
+
+func TestHealthz_AdapterDown(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.RegisterAdapter(fakeAdapter{"discord", false})
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"ok":false`) {
+		t.Fatalf("body=%s", rec.Body.String())
+	}
+}
+
+func TestHealthz_NoAdapters(t *testing.T) {
+	// Default to OK if no adapter registered — Espur itself is responding.
+	s, _ := newTestServer(t)
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+}
+
 func TestSetKey_RoundTrip(t *testing.T) {
 	s, db := newTestServer(t)
 	ctx := context.Background()

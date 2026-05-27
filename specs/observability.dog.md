@@ -55,7 +55,7 @@ Author labels, ids, message ids, vendor ids, thread ids (encoded), counts, durat
 **Health.**
 
 - `Healthy()` on each [[adapter]] is exposed in the web UI status panel.
-- The web UI's own readiness is implicit in whether it answers HTTP at all; there is no separate `/healthz` endpoint in v0.1.
+- The web UI also exposes `GET /healthz` returning JSON `{ok, adapters:[{platform, healthy}]}`. 200 when all registered adapters are healthy, 503 otherwise. Body shape is stable across both status codes so scrapers can parse one way. This endpoint is the only path on the admin port that an orchestrator / reverse proxy is expected to hit unauthenticated; deploys SHOULD allow it past auth.
 - Liveness from the container runtime's perspective is "the process is running"; Espur does not need a self-kill watchdog.
 
 **Request-ID lifecycle.**

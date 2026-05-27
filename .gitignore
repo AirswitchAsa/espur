@@ -1,0 +1,22 @@
+# runtime state
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# secrets / local env
+.env
+.env.*
+
+# build artifacts
+bin/
+tmp/
+
+# templ generated code
+*_templ.go
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/

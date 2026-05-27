@@ -46,6 +46,33 @@ func TestSplit_LineBoundaryPreferred(t *testing.T) {
 	}
 }
 
+func TestSplit_LargeFenceClosedCleanlyOnSplit(t *testing.T) {
+	// A long code block that won't fit in one chunk under a typical
+	// Discord-ish cap. The chunker must respect the cap AND close the
+	// fence with "```" when splitting mid-fence, so downstream
+	// renderers don't drag the code styling onto plain text.
+	body := "```go\n" + strings.Repeat("filler line of code\n", 200) + "```\nafter the block"
+	got := Split(body, 500)
+	for i, ch := range got {
+		if len(ch) > 500 {
+			t.Fatalf("chunk[%d] over cap: len=%d", i, len(ch))
+		}
+	}
+	// At least one of the early chunks should end with the close marker
+	// so Discord stops rendering as code.
+	if !strings.HasSuffix(strings.TrimSpace(got[0]), "```") {
+		t.Fatalf("first chunk should close the fence; got tail=%q",
+			tail(got[0], 12))
+	}
+}
+
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+
 func TestSplit_KeepsCodeFenceIntact(t *testing.T) {
 	body := "before the fence\n```go\nlong line of code inside fence one\nanother long line of code inside fence two\nyet another inside fence three\n```\nafter"
 	got := Split(body, 50)

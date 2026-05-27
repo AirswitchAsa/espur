@@ -180,7 +180,7 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 	// opencode 1.15.11, intermittently drops the trailing `type=text` event
 	// (the session record has the text — stdout doesn't). The session export
 	// is authoritative, so we pull assistant text from there.
-	text, exportErr := exportAssistantText(runCtx, bin, sessionID)
+	text, exportErr := exportAssistantText(runCtx, bin, sessionID, req.Vendor.CredEnv)
 	if exportErr != nil {
 		res.Outcome = OutcomeCrash
 		res.CrashReason = "export_failed"
@@ -265,10 +265,14 @@ type ocExport struct {
 	} `json:"messages"`
 }
 
-func exportAssistantText(ctx context.Context, bin, sessionID string) (string, error) {
+func exportAssistantText(ctx context.Context, bin, sessionID string, creds map[string]string) (string, error) {
 	cmd := exec.CommandContext(ctx, bin, "export", sessionID)
-	// Match the run env so auth.json + XDG resolution is consistent.
-	cmd.Env = buildEnv(nil)
+	// Match the run env so auth.json + XDG resolution is consistent. We
+	// also propagate the same CredEnv: BYO-key vendors need their key
+	// available to `opencode export` too (it talks to the same API to
+	// fetch the session record). Test fakes use this channel to control
+	// the fake binary's behaviour.
+	cmd.Env = buildEnv(creds)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

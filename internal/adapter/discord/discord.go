@@ -76,12 +76,33 @@ func (a *Adapter) Start(ctx context.Context) (<-chan adapter.Event, error) {
 	return a.events, nil
 }
 
+// emitBudget is the max time emit will wait to push an event onto the
+// inbound channel. Per specs/adapter.dog.md: "If full for >1s, the adapter
+// logs at warn and drops." Package-level so tests can shrink it.
+var emitBudget = time.Second
+
 func (a *Adapter) emit(ev adapter.Event) {
 	select {
 	case a.events <- ev:
-	case <-time.After(time.Second):
-		// Channel backpressure: spec says drop with warn log + Disconnected
-		// event for operator visibility; here we just drop.
+		return
+	case <-time.After(emitBudget):
+		// Channel backpressure. Per specs/adapter.dog.md, repeated drops
+		// must emit a Disconnected{cause="downstream backpressure"} so the
+		// operator sees something in the web UI status panel. The transport
+		// stays up; this is a signal to fix the downstream, not the adapter.
+	}
+	// Best-effort enqueue of the lifecycle event with a tiny budget — if
+	// even that doesn't fit, we genuinely have nowhere to surface it.
+	dropEv := adapter.Event{Lifecycle: &adapter.LifecycleEvent{
+		Platform: a.Platform(),
+		Kind:     adapter.LifecycleDisconnected,
+		Cause:    "downstream backpressure",
+		At:       time.Now(),
+	}}
+	select {
+	case a.events <- dropEv:
+	case <-time.After(emitBudget):
+		// Channel is fully wedged; nowhere to put the signal.
 	}
 }
 

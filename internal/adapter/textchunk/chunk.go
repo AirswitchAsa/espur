@@ -40,6 +40,7 @@ func Split(body string, maxLen int) []string {
 		// must be flushed *with* the open block, not after it, so the cap
 		// check uses the pre-toggle state.
 		wasInFence := inFence
+		wasFenceTag := fenceTag
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "```") {
 			if !inFence {
@@ -53,7 +54,19 @@ func Split(body string, maxLen int) []string {
 		if i > 0 {
 			addition = "\n" + line
 		}
-		if current.Len()+len(addition) > maxLen && !wasInFence && current.Len() > 0 {
+		// Cap is a hard contract: chunks must never exceed maxLen. Fence
+		// preservation across splits is a soft goal; if a chunk we'd produce
+		// to keep the fence intact would itself overflow, we just close the
+		// fence cleanly when there's room, and accept that the rendering on
+		// subsequent chunks may be plain text. For typical platform limits
+		// (Discord 2000, WeChat 1800) the close-marker overhead is trivial
+		// so fences essentially always survive.
+		closeOverhead := len("\n```")
+		if current.Len()+len(addition) > maxLen && current.Len() > 0 {
+			if wasInFence && current.Len()+closeOverhead <= maxLen {
+				current.WriteString("\n```")
+			}
+			_ = wasFenceTag // reserved for future re-open logic
 			flush()
 			addition = line
 		}

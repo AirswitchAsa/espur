@@ -61,6 +61,6 @@ A subsequent boot per [[bootstrap]] resumes from durable state with no knowledge
 ## Notes
 
 - Default drain deadline of 30s, overridable via `ESPUR_SHUTDOWN_DRAIN`, with a runtime floor at `ESPUR_OPENCODE_TIMEOUT`. The floor exists because shipping a drain shorter than the per-invocation timeout makes every in-flight invocation a guaranteed abort. Operators with shorter container grace windows (e.g. Fly's 5s default) should either accept the abort rate or extend the platform grace window to match.
-- TODO(decision): should phase-2 actually drain coalesced-waiting triggers (give them their one shot) instead of dropping them? Suggest no — they were never started, and starting work after the shutdown signal violates the "no new work" contract. Confirm.
+- Decided: phase-2 does NOT drain coalesced-waiting triggers — once draining begins, a message still sitting in a thread's coalesce slot is dropped. It was never started, and starting work after the shutdown signal would violate the "no new work" contract. In-flight invocations still finish.
 - The deliberate decision to not serialize in-flight state to disk is a simplicity bet. The alternative (persistent queue + resume) is implementable later if real usage shows the dropped-turn rate is bad.
 - Shutdown does not attempt to rotate or delete OAuth tokens or any other secret. Whatever was encrypted at rest stays as it was.

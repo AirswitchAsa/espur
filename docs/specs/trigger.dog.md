@@ -44,4 +44,4 @@ Dropped duplicates and coalesced predecessors produce no opencode invocation and
 - Mention detection is per-platform: Discord uses the bot user ID, WeChat uses configured nickname / @-token matching, etc. The adapter is the only place that knows this.
 - Edited messages are out of scope for the first cut — treat the edit as a no-op, not a new trigger.
 - TODO(decision): how long should the dedup memory of `(platform, message_id)` be retained? README does not say. Suggest 24h sliding window, persisted in SQLite, but confirm.
-- TODO(decision): when an adapter restarts and replays history, should already-processed messages re-trigger? Implied "no" by the dedup rule, but the dedup table must outlive process restarts for that to hold — confirm SQLite-backed dedup is intended.
+- Decided: dedup is SQLite-backed, so it outlives process restarts — an adapter that replays history on reconnect does not re-trigger already-processed messages.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -259,6 +260,48 @@ func TestVendorReorder_UnknownVendorIsNoop(t *testing.T) {
 	vs, _ := db.ListVendors(ctx)
 	if len(vs) != 1 || vs[0].VendorID != "a" {
 		t.Fatalf("unexpected change: %+v", vs)
+	}
+}
+
+func TestThreads_ListAndDetail(t *testing.T) {
+	s, _ := newTestServer(t)
+	platform, thread := "discord", "chan-xyz"
+
+	if err := s.ts.Append(platform, thread, transcript.Record{
+		Kind:   transcript.KindUser,
+		Author: transcript.Author{ID: "u1", Label: "alice"},
+		Body:   "hello world",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dir := s.ts.ThreadDir(platform, thread)
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("# memory index"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fact_foo.md"), []byte("detail"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/threads", nil))
+	if rec.Code != 200 {
+		t.Fatalf("threads list status %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), platform) {
+		t.Fatalf("threads list missing platform: %s", rec.Body.String())
+	}
+
+	enc := filepath.Base(dir)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/threads/"+platform+"/"+enc, nil))
+	if rec.Code != 200 {
+		t.Fatalf("thread detail status %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"memory index", "fact_foo.md", "hello world"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("thread detail missing %q: %s", want, body)
+		}
 	}
 }
 

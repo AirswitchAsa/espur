@@ -126,7 +126,14 @@ func (c *Core) AbortInFlight() {
 // StopAccepting marks the core as draining: Dispatch will reject new
 // triggers, but in-flight HandleTrigger calls keep running until WaitDrain
 // returns. Idempotent.
-func (c *Core) StopAccepting() { c.stopped.Store(true) }
+//
+// Sets the flag under c.mu so it is mutually exclusive with enqueue's
+// inflight.Add — this is what closes the shutdown drain race (see enqueue).
+func (c *Core) StopAccepting() {
+	c.mu.Lock()
+	c.stopped.Store(true)
+	c.mu.Unlock()
+}
 
 // WaitDrain blocks until all in-flight HandleTrigger calls complete or ctx
 // expires. Returns true if the drain finished cleanly, false on deadline.
@@ -185,23 +192,8 @@ func (c *Core) onMessage(ctx context.Context, m *adapter.MessageEvent) {
 		"platform", m.Platform, "thread_id", m.ThreadID,
 		"message_id", m.PlatformMessageID)
 
-	// Enqueue / coalesce.
-	key := m.Platform + ":" + m.ThreadID
-	c.mu.Lock()
-	q, ok := c.queues[key]
-	if !ok {
-		q = &threadQueue{
-			core:     c,
-			platform: m.Platform,
-			threadID: m.ThreadID,
-			incoming: make(chan *adapter.MessageEvent, 1),
-			coalesce: nil,
-		}
-		c.queues[key] = q
-		go q.loop(ctx)
-	}
-	c.mu.Unlock()
-	q.submit(ctx, m)
+	// Enqueue / coalesce. See queue.go.
+	c.enqueue(ctx, m)
 }
 
 // PostAdapterEvent is exposed for adapters wishing to push pre-built events

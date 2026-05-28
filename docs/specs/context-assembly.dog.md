@@ -45,10 +45,9 @@ No other content is in the user message. opencode receives nothing else from Esp
 
 ## Notes
 
-- N is the transcript-tail length. README does not pin a number.
-  - TODO(decision): default value for N. Suggest 30 lines, configurable per-deploy via env var; confirm.
-- TODO(decision): should the tail be line-count bounded, byte-bounded, or token-bounded? Token bounding is safer for vendor-side context limits but more code. Suggest line-count with a hard byte cap (e.g. 8 KiB) as a guard; confirm.
-- TODO(decision): how should multi-line messages from a single author be represented in the transcript tail? Single line with `\n` literals, or repeated author label per physical line? Suggest preserve newlines, render as one labelled block per message; confirm.
+- Decided: N (transcript-tail length) defaults to 30, configurable per-deploy.
+- Decided: the tail is line-count bounded with a hard 8 KiB byte cap as a guard; on overflow the oldest lines are dropped (the current request is always preserved verbatim, outside the cap).
+- Decided: multi-line messages preserve their newlines and render as one labelled block per message (not a single `\n`-literal line, not repeated author labels per physical line).
 - The transcript itself (storage, append, tail read) is described separately — context assembly is a pure read of the tail.
 - Attachments, images, embeds: out of scope for the first cut. Adapters render them to a placeholder text token in the transcript.
 - The exact wrapper tag names (`thread-context`, `request`) are an implementation choice but must be stable so opencode behavior is reproducible.

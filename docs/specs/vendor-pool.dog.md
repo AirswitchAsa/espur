@@ -84,9 +84,9 @@ Timeouts and crashes do not mutate penalty-box state.
 
 ## Notes
 
-- TODO(decision): exact base / cap / jitter constants for backoff. README says "exponential backoff with jitter" without numbers. Suggested defaults above (30s base, 1h cap, ±50% jitter); confirm.
-- TODO(decision): is a single 5xx enough to penalize, or do we want N-in-a-row before counting it? Suggest single 5xx triggers cooldown but with the shortest backoff step; confirm.
-- TODO(decision): on cooldown expiry should the vendor go to `eligible` immediately, or to a "half-open" probe state limited to one attempt? Suggest plain `eligible` for simplicity; confirm.
-- TODO(decision): does the user want a manual "clear penalty" button in the web UI, or only the implicit clear by re-saving credentials? Suggest both — see [[webui]].
+- Decided: backoff steps are 30s, 60s, 2m, 4m, 8m, 16m, 32m, capped at 1h, indexed by failure streak, with uniform ±50% jitter.
+- Decided: a single 5xx triggers cooldown immediately (no N-in-a-row threshold); it just starts at the shortest backoff step.
+- Decided: on cooldown expiry the vendor returns to plain `eligible` (lazily, on next consult) — no half-open probe state.
+- Decided: both clears exist — a manual "clear penalty" button in the web UI and the implicit clear on credential re-save. See [[webui]].
 - A vendor toggled `enabled = false` in the web UI is skipped regardless of penalty state and does not consume its slot. Re-enabling does not reset the penalty box; status stays as last persisted.
 - The pattern list for failure classification lives in code (Go constants / regexps) so it can evolve without spec churn. The spec only fixes the **categories** (429, quota/limit phrases, 5xx, auth).

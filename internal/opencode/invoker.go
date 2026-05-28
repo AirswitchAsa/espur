@@ -22,7 +22,7 @@ import (
 const DefaultTimeout = 120 * time.Second
 
 // DefaultKillGrace is the grace period between SIGTERM and SIGKILL on timeout.
-// Spec: opencode-invoke.dog.md TODO(decision) — pinned to 5s.
+// Spec: opencode-invoke.dog.md "Notes" — grace period pinned to 5 seconds.
 const DefaultKillGrace = 5 * time.Second
 
 // Outcome enumerates the terminal categories defined in

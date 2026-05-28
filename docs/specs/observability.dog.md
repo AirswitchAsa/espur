@@ -82,7 +82,7 @@ No user content, no credentials, and no secret material ever leave Espur via log
 
 ## Notes
 
-- TODO(decision): log record format — JSON (recommended) or logfmt? Suggest JSON for trivial container-log parsing; confirm.
-- TODO(decision): should `info` include per-incoming-message lines, or only state transitions? Suggest one `info` per accepted trigger (`event=trigger.accepted`) and one per invocation outcome (`event=invocation.success` or matching failure), nothing finer-grained at `info`. Confirm.
-- TODO(decision): event name registry — do we maintain it in a central place (a constants file, a doc) or let it grow ad-hoc? Suggest a flat constants file in code that the spec doesn't have to mirror line-by-line; confirm.
+- Decided: log records are JSON, one object per line, written to stdout (trivial container-log parsing).
+- Decided: at `info`, one record per accepted trigger (`event=trigger.accepted`) and one per invocation outcome (`event=invocation.success` or the matching failure); nothing finer-grained at `info`.
+- Decided: the event-name registry is a flat constants file in code (`internal/obs/events.go`); the spec does not mirror it line-by-line.
 - The deliberate omission of OpenTelemetry, Prometheus, distributed tracing, and a built-in log viewer is a v0.1 simplicity choice. Spec extension is the path forward if any of those become needed.

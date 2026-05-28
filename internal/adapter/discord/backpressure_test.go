@@ -13,20 +13,23 @@ import (
 // operator can see the drop in the web UI. docs/specs/adapter.dog.md.
 func TestEmit_BackpressureSurfacesDisconnected(t *testing.T) {
 	prev := emitBudget
-	emitBudget = 20 * time.Millisecond
+	emitBudget = 50 * time.Millisecond
 	t.Cleanup(func() { emitBudget = prev })
 
-	// Buffer of 2: one slot pre-filled with junk so the user-message push
-	// times out, then the *next* slot is free for the Disconnected event.
+	// Buffer of 2, both slots pre-filled with junk so the channel is full:
+	// the user-message push times out, and only once we free a slot can the
+	// fallback Disconnected event fit.
 	a := &Adapter{events: make(chan adapter.Event, 2)}
 	a.events <- adapter.Event{Lifecycle: &adapter.LifecycleEvent{Kind: adapter.LifecycleConnected}}
 	a.events <- adapter.Event{Lifecycle: &adapter.LifecycleEvent{Kind: adapter.LifecycleConnected}}
 
-	// Spawn a draining goroutine that removes one event AFTER emit times
-	// out (so the user-msg slot truly couldn't be filled), making the
-	// fallback Disconnected event fit.
+	// emit's two selects run back-to-back: the first (user-msg push) times
+	// out at ~emitBudget, then the fallback push waits a second emitBudget,
+	// so its window is (emitBudget, 2*emitBudget). Drain at 1.5*emitBudget —
+	// the middle of that window — so the user-msg push has definitely timed
+	// out but the fallback push still has ~0.5*emitBudget of slack to land.
 	go func() {
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(75 * time.Millisecond)
 		<-a.events // free one slot for the Disconnected enqueue
 	}()
 

@@ -77,9 +77,9 @@ A trigger never produces zero replies and never produces more than one (the coal
 
 ## Notes
 
-- TODO(decision): exact prose of timeout / drained / crash messages. Wording above is a strawman; user should pin once before code lands.
-- TODO(decision): should the all-drained reply include retry-in estimates derived from `cooldown_until`, or only "rate-limited" / "auth failed" with no time? Suggest include estimates (rounded to nearest minute, "<1m" floor) since they actually help the user; confirm.
-- TODO(decision): request ID format. Suggest 8-char Crockford base32 (e.g. `XK4Q7B9R`); confirm.
-- TODO(decision): on auth-only-drained, should the reply text differ from generic drained (e.g. lead with "All configured vendors need reconfiguration" since waiting won't help)? Suggest yes — it changes what the user should do. Confirm.
+- Decided: message prose is pinned in code. Timeout = "Took too long, aborted. Try again or rephrase."; crash = "Internal error. Check logs. Request ID: `<id>`."; drained = the enumerated form below.
+- Decided: the all-drained reply includes retry-in estimates derived from `cooldown_until`, rounded to the nearest minute with a "<1m" floor (and "Nh Nm" past an hour).
+- Decided: request ID is an 8-char Crockford base32 token (e.g. `XK4Q7B9R`).
+- Decided: auth-only-drained leads with "All configured vendors need reconfiguration (auth failed)." and marks each vendor "needs reconfigure", since waiting won't help — distinct from the generic rate-limit drained text.
 - Reply must never include raw vendor error strings, stack traces, or credential fragments. Adapter sanitization is the last line of defense; the request ID lookup is how operators get the detail.
 - If posting the reply itself fails (network error to the IM platform), the adapter retries within a small bounded window. Persistent post failure is logged and the request is considered done — Espur does not block the thread queue waiting on IM-side recovery.

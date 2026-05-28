@@ -25,7 +25,8 @@ type Vault struct {
 }
 
 // New parses an age secret-key string (`AGE-SECRET-KEY-...`) into a Vault.
-// Spec: secrets.dog.md TODO(decision) — pinned to raw secret-key in env.
+// Spec: secrets.dog.md "Credential model" — the master key is a raw age
+// secret-key string in ESPUR_MASTER_KEY (passphrase-wrapped files unsupported).
 func New(masterKey string) (*Vault, error) {
 	masterKey = strings.TrimSpace(masterKey)
 	if masterKey == "" {
@@ -77,9 +78,8 @@ func (v *Vault) SelfTest(blob []byte) error {
 	return err
 }
 
-// GenerateIdentity returns a freshly-minted age secret-key string. Useful for
-// tests and one-off deploy bootstrapping (`espur genkey`-style, not wired up
-// yet in v0.1).
+// GenerateIdentity returns a freshly-minted age secret-key string. Used by the
+// cmd/espur-genkey binary for the one-time deploy bootstrap step, and by tests.
 func GenerateIdentity() (string, error) {
 	id, err := age.GenerateX25519Identity()
 	if err != nil {

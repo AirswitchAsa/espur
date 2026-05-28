@@ -304,6 +304,10 @@ func (p *Pool) loadCredEnv(ctx context.Context, vendorID string) (map[string]str
 	if err != nil {
 		return nil, err
 	}
+	// A vendor credential is a single secret value. EnvKeys are name aliases
+	// for that one value (e.g. a provider that reads either FOO_API_KEY or
+	// FOO_KEY), NOT distinct secrets — so each key maps to the same plaintext.
+	// See docs/specs/secrets.dog.md "Credential model".
 	out := map[string]string{}
 	for _, k := range c.EnvKeys {
 		if k == "" {

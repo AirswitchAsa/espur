@@ -69,6 +69,40 @@ func TestShutdown_StopAcceptingRejectsNewTriggers(t *testing.T) {
 	}
 }
 
+// TestShutdown_DrainCountsAcceptedBeforeWorkerStarts is a regression test for
+// the drain race: a message that has been accepted (Dispatch has returned) must
+// be counted by WaitDrain even if its worker goroutine has not yet begun the
+// invocation. Previously the inflight WaitGroup was incremented inside the
+// worker, so a shutdown beginning in the gap between "accepted" and "worker
+// running" could observe an empty WaitGroup and tear down the DB under a
+// starting invocation. We deliberately do NOT wait for the invocation to start.
+func TestShutdown_DrainCountsAcceptedBeforeWorkerStarts(t *testing.T) {
+	inv := &blockingInvoker{
+		release:      make(chan struct{}),
+		finalOutcome: opencode.OutcomeSuccess,
+	}
+	core, _, _ := newCore(t, inv)
+
+	core.Dispatch(context.Background(), adapter.Event{Message: &adapter.MessageEvent{
+		Platform: "discord", ThreadID: "ch-1", PlatformMessageID: "m-race",
+		Author: adapter.Author{Label: "alice"}, Body: "ping", Mention: true,
+	}})
+	// No sync on invocation start — begin shutdown immediately.
+	core.StopAccepting()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if core.WaitDrain(ctx) {
+		t.Fatal("WaitDrain returned true while an accepted message was still pending")
+	}
+	// Drain the worker before returning so its async writes don't race t.TempDir
+	// cleanup.
+	close(inv.release)
+	drainCtx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer dcancel()
+	core.WaitDrain(drainCtx)
+}
+
 // TestShutdown_WaitDrainCompletesOnInflightFinish drives a trigger into
 // in-flight state, then asserts WaitDrain blocks until the invocation
 // finishes and returns true.
@@ -147,7 +181,13 @@ func TestShutdown_WaitDrainTimesOut(t *testing.T) {
 	if ok := core.WaitDrain(ctx); ok {
 		t.Fatal("WaitDrain returned true despite deadline expiring")
 	}
-	close(inv.release) // unblock so the test goroutine drains cleanly
+	// Unblock and then wait for the worker to actually finish before the test
+	// returns — otherwise its async transcript writes race with the t.TempDir
+	// cleanup ("directory not empty").
+	close(inv.release)
+	drainCtx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer dcancel()
+	core.WaitDrain(drainCtx)
 }
 
 // TestShutdown_AbortInFlightCancelsExecContext verifies that the second-

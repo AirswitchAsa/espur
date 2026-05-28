@@ -64,7 +64,7 @@ Subsequent invocations of `opencode run` for this thread will use this directory
 ## Notes
 
 - TODO(decision): exact final wording of the seed prompt is implementation work, but the **rule list above is the spec**. If we want to change a rule (e.g., allow multi-line index entries), update this spec first.
-- TODO(decision): do we want a `README.md` (or similar) inside the working dir aimed at humans peeking via the web UI? Suggest no — `AGENTS.md` is already human-readable; one file is simpler.
-- TODO(decision): retention policy for thread working directories. README is silent. Suggest never auto-delete; expose size in the web UI thread list and let the operator clean up manually. Confirm.
-- TODO(decision): how should `thread_id` be encoded into a filesystem path? Suggest URL-safe-base64 of the platform-prefixed id (`discord:<channel_id>`) with a length cap; confirm.
+- Decided: no separate `README.md` in the working dir — `AGENTS.md` is already human-readable, so one file is simpler.
+- Decided: thread working directories are never auto-deleted. The web UI thread list exposes each dir's size; the operator cleans up manually.
+- Decided: the path is `<data>/threads/<platform>/<encoded_thread_id>`, where the platform is its own path segment and the thread id is URL-safe (raw, unpadded) base64 with a length cap.
 - The seed never mentions specific vendor names or Espur internals — opencode should be agnostic to which vendor it is running under.

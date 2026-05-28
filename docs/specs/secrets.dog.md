@@ -12,6 +12,12 @@ Espur stores credentials that an attacker with read access to `data/espur.db` mu
 - The SQLite row also carries non-secret metadata in plaintext columns: created/updated timestamps, a credential `kind` (`byo_key`, `oauth`, `platform_token`, ...), and a short `status` flag (`set` / `expired` / `revoked`).
 - The credential **value** itself (api key, OAuth token bundle, platform token) is never present in plaintext columns, log lines, web UI HTML, or process memory dumps for longer than the lifetime of a single use.
 
+**Credential model — one secret, name aliases.**
+
+- A credential row holds exactly **one** secret value (one age blob). It does **not** hold multiple distinct secrets.
+- The row also carries one or more env-var **names** (`env_keys`). At use time, [[vendor-pool]] exposes that single secret value under each of those names — they are aliases for the same value (e.g. a provider that accepts either `FOO_API_KEY` or `FOO_KEY`), never a way to carry a second secret such as a separate "key + secret" pair.
+- A vendor that genuinely needs two distinct secret values is out of scope for v0.1; if one is ever added, this model gets revisited (a JSON-encoded blob of name→value), and this spec is updated first.
+
 **At boot.**
 
 - `ESPUR_MASTER_KEY` is read once at process start and held as an age identity in process memory. It is never written to disk or logged.
@@ -63,7 +69,7 @@ For every credential Espur holds:
 
 ## Notes
 
-- TODO(decision): age identity format — passphrase-wrapped X25519 key file vs. raw `AGE-SECRET-KEY-...` in the env var. Suggest raw secret-key string in env for v0.1 (simplest, fits container env model); confirm.
-- TODO(decision): should the self-test at boot be opt-out for very first run (when the DB has no blobs yet)? Suggested behavior above already handles this; confirm.
+- Decided: age identity format is a raw `AGE-SECRET-KEY-...` X25519 secret-key string in the `ESPUR_MASTER_KEY` env var (simplest, fits the container env model). Passphrase-wrapped key files are not supported in v0.1.
+- Decided: the boot self-test is implicitly skipped when the DB has no blobs yet (a blank database is a valid first-run state — see "At boot" above). No separate opt-out flag.
 - The choice to keep transcript bodies in plaintext on disk is deliberate — the threat model is "someone exfiltrates `data/`" and transcripts are recoverable from the IM platform itself anyway. Credentials are the asymmetric loss.
 - A future hardening step is to extend encryption to transcripts and `AGENTS.md`. Explicitly out of scope for v0.1.

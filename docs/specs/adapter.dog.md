@@ -87,7 +87,7 @@ Each enabled platform has exactly one running `Adapter` whose `Start`-returned c
 
 ## Notes
 
-- TODO(decision): exact inbound channel buffer size and the backpressure-drop threshold (default proposed: buffer 16, drop after >1s blocked). Tune after real Discord-load testing.
+- Decided: inbound channel buffer is 16 and the backpressure-drop threshold is >1s blocked (after which the adapter surfaces a `Disconnected{cause="downstream backpressure"}`). May be tuned after real Discord-load testing.
 - TODO(decision): per-platform outbound retry constants (3 attempts, 1s/3s/9s) — confirm before Discord adapter lands.
 - TODO(decision): per-platform freshness window for `Healthy()` (Discord gateway heartbeat ack window ≈ 60s; pin per adapter, not as a global constant).
 - Known minor gap: if Espur is shutting down between `opencode` success and `Post` completion, the user's trigger is in the dedup table but no reply was sent. On next boot the user's resend would be deduped. Acceptable for v0.1; logged at warn so the operator can see it. Revisit if it bites in practice.

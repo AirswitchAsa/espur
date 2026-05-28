@@ -112,6 +112,35 @@ func TestBot_HappyPath(t *testing.T) {
 	}
 }
 
+// TestBot_QueueRetiredWhenIdle verifies the per-thread queue (and its worker
+// goroutine) is removed from the map once the thread goes idle, so a long-lived
+// deployment does not leak a goroutine per thread ever seen. Regression for #3.
+func TestBot_QueueRetiredWhenIdle(t *testing.T) {
+	inv := &fakeInvoker{results: []opencode.Result{{Outcome: opencode.OutcomeSuccess, AssistantText: "pong"}}}
+	core, fa, _ := newCore(t, inv)
+
+	core.Dispatch(context.Background(), adapter.Event{Message: &adapter.MessageEvent{
+		Platform: "discord", ThreadID: "ch-1", PlatformMessageID: "m-1",
+		Author: adapter.Author{Label: "alice"}, Body: "ping", Mention: true,
+	}})
+	<-fa.done // reply posted; worker is about to retire the queue
+
+	deadline := time.After(time.Second)
+	for {
+		core.mu.Lock()
+		n := len(core.queues)
+		core.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("queue not retired; %d queue(s) remain", n)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 func TestBot_DropsDuplicate(t *testing.T) {
 	inv := &fakeInvoker{results: []opencode.Result{{Outcome: opencode.OutcomeSuccess, AssistantText: "pong"}}}
 	core, fa, _ := newCore(t, inv)

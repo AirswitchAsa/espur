@@ -22,8 +22,10 @@ func (d *DB) SeenMessage(ctx context.Context, platform, messageID string) (first
 	return n > 0, nil
 }
 
-// PurgeDedupOlderThan deletes dedup rows older than the given age. Called
-// opportunistically; the table is small.
+// PurgeDedupOlderThan deletes dedup rows older than the given age. Not yet
+// wired to a caller: the retention window is an open decision (see
+// trigger.dog.md). The table is small, so unbounded growth is tolerable until
+// that window is pinned.
 func (d *DB) PurgeDedupOlderThan(ctx context.Context, age time.Duration) error {
 	cutoff := time.Now().Add(-age).Unix()
 	_, err := d.sql.ExecContext(ctx, `DELETE FROM dedup WHERE seen_at < ?`, cutoff)

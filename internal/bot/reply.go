@@ -9,8 +9,8 @@ import (
 	"github.com/punny/espur/internal/vendor"
 )
 
-// crockford32 — pinned per docs/specs/reply.dog.md TODO(decision): 8-char Crockford
-// base32 token used as the request id on crash replies.
+// crockford32 — per docs/specs/reply.dog.md "Notes": the request id on crash
+// replies is an 8-char Crockford base32 token.
 const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 // NewRequestID returns a fresh 8-char Crockford base32 token.

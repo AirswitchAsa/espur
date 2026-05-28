@@ -73,9 +73,9 @@ After interacting with the UI:
 
 ## Notes
 
-- TODO(decision): default UI port. README suggests `:8080`; confirm and document in deploy section.
-- TODO(decision): auth model. README says "HTTP basic auth or your own SSO" via the reverse proxy. Confirm Espur ships zero auth itself (no in-process basic-auth fallback); if any in-process auth is wanted, it must be specced separately.
+- Decided: default UI port is `:8080` (`ESPUR_WEB_PORT`).
+- Decided: Espur ships zero in-process auth — the admin UI relies entirely on reverse-proxy auth. Any in-process auth would have to be specced separately.
 - OAuth callback URLs: not applicable. v0.1 delegates OAuth to opencode's own CLI per [[oauth]]; the admin port hosts no callback path.
 - TODO(decision): does the operator want a "test this vendor now" button on the vendor row (fires a canned `opencode run` against it and shows ok / error)? Useful but not in README. Out of scope for v0.1 unless confirmed.
 - TODO(decision): retention / hard-delete of a thread from the UI. README is silent and the threads page in this spec has no delete button. Confirm v0.1 deliberately omits it.
-- TODO(decision): exposing transcript / `AGENTS.md` in the UI is convenient for the operator but leaks user content to anyone who can reach the UI. Confirm the deployment-time assumption (reverse-proxy auth is mandatory).
+- Decided: the UI exposes transcript / `AGENTS.md` content; reverse-proxy auth in front of the admin port is therefore mandatory at deploy time (the UI itself has no auth — see above).

@@ -14,8 +14,8 @@ type Credential struct {
 	ID        string
 	Kind      string   // byo_key | oauth | platform_token
 	Status    string   // set | missing | expired | revoked
-	Blob      []byte   // age ciphertext; never plaintext
-	EnvKeys   []string // env var names the plaintext should be exposed as on the child env.
+	Blob      []byte   // age ciphertext of the single secret value; never plaintext
+	EnvKeys   []string // env var name(s) to expose that one secret under (aliases, not distinct values)
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

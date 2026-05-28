@@ -83,7 +83,7 @@ A failed boot exits non-zero and logs a single human-readable reason. Espur neve
 
 ## Notes
 
-- TODO(decision): exact env-var names listed above are strawmen; pin once the deploy doc lands. The set itself is fixed by the spec.
+- Decided: the env-var names above are pinned and implemented (see `docs/architecture.md` for the reference table).
 - TODO(decision): on a fresh deploy, should the web UI ship a first-time-setup banner that walks the operator through "add a vendor" / "connect an adapter"? Suggest yes, but minor and can be added post-v0.1.
-- TODO(decision): does `ESPUR_DATA_DIR` accept absolute paths only, or also relative? Suggest both, resolved at boot; confirm.
+- Decided: `ESPUR_DATA_DIR` accepts both absolute and relative paths, resolved at boot (default `./data`, container `/data`).
 - The deliberate refusal to bring config files into v0.1 is to keep deploys boring: a container with env vars and a mounted volume is the whole story.

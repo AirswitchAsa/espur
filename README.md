@@ -54,6 +54,7 @@ ESPUR_LOG_LEVEL=debug
 
 - [`docs/overview.md`](docs/overview.md) — what Espur does and how it behaves.
 - [`docs/architecture.md`](docs/architecture.md) — tech stack, repo layout, env-var reference, build order.
+- [`docs/testing.md`](docs/testing.md) — end-to-end acceptance testing with Docker (golden path, coalescing, graceful drain, persistence).
 - [`docs/specs/*.dog.md`](docs/specs/) — authoritative behavioral contracts. If prose docs disagree with a spec, the spec wins.
 
 ## License

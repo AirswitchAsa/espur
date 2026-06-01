@@ -571,7 +571,7 @@ const threadDetailTpl = `{{ define "thread_detail" }}
     <div class="es-danger__row">
       <div class="es-danger__txt">
         <span class="es-danger__name">Reset bot memory</span>
-        <span class="es-danger__desc">Empties <code>AGENTS.md</code> — the file the bot uses to remember facts about this thread. Your <code>NOTES.md</code>, transcript, and workdir files are kept.</span>
+        <span class="es-danger__desc">Deletes the bot's remembered facts for this thread — <code>memory_index.md</code> and its per-fact slug files. Your custom instructions (<code>AGENTS.md</code>) and the transcript are kept.</span>
       </div>
       <button class="ds-btn ds-btn--danger ds-btn--sm" data-open="confirm-wipe">{{ template "icon-trash" }}<span class="ds-btn__label">Reset memory</span></button>
     </div>
@@ -589,8 +589,8 @@ const threadDetailTpl = `{{ define "thread_detail" }}
     <div class="es-modal" role="dialog" aria-modal="true">
       <div class="es-modal__head">{{ template "icon-alert" }}<span class="es-modal__title">Reset bot memory</span></div>
       <div class="es-modal__body">
-        This empties <strong>AGENTS.md</strong>, the bot's own memory file for this thread. Your <code>NOTES.md</code> stays put.
-        <div class="es-modal__detail">{{ .Workdir }}/AGENTS.md</div>
+        This deletes the bot's memory files — <strong>memory_index.md</strong> and its slug <code>*.md</code> fact files. Your custom instructions in <code>AGENTS.md</code> and the transcript stay put.
+        <div class="es-modal__detail">{{ .Workdir }}/*.md (except AGENTS.md)</div>
       </div>
       <div class="es-modal__foot">
         <button type="button" class="ds-btn ds-btn--ghost" data-close="confirm-wipe"><span class="ds-btn__label">Cancel</span></button>

@@ -3,6 +3,7 @@
 A minimal Go service that bridges IM platforms (Discord, WeChat, …) to [opencode](https://opencode.ai) as the agent runtime. Named after the Pokémon Espurr. Personal / non-commercial use.
 
 When you @mention the bot on a thread, Espur shells out to `opencode run`, posts the reply back, and lets opencode keep its own long-term memory per thread.
+<img width="994" height="710" alt="image" src="https://github.com/user-attachments/assets/43ccd038-fe49-44eb-888d-fad9d5ed4546" />
 
 ## Quickstart
 

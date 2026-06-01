@@ -96,7 +96,7 @@ const vendorsTpl = `{{ define "vendors" }}
 <table>
   <thead><tr><th>#</th><th>vendor_id</th><th>model</th><th>enabled</th><th>kind</th><th>cred</th><th>penalty</th><th>actions</th></tr></thead>
   <tbody>
-  {{ range $i, $r := . }}
+  {{ range $i, $r := .Rows }}
   <tr>
     <td>{{ $i }}</td>
     <td><code>{{ $r.Vendor.VendorID }}</code></td>
@@ -145,15 +145,49 @@ const vendorsTpl = `{{ define "vendors" }}
 <h3>Add vendor</h3>
 <form method="post" action="/vendors/add">
   <label>vendor_id <input name="vendor_id" required placeholder="anthropic-byo"></label>
-  <label>model <input name="model" required placeholder="anthropic/claude-haiku-4-5"></label>
+  <label>model
+    <select name="model" id="model-select" required>
+      <option value="">— select a model —</option>
+      {{ range .Providers }}
+      <optgroup label="{{ .Name }}">
+        {{ $p := . }}
+        {{ range .Models }}
+        <option value="{{ $p.ID }}/{{ . }}"
+                data-provider="{{ $p.ID }}"
+                data-env="{{ $p.EnvKey }}"
+                data-oauth="{{ if $p.SupportsOAuth }}1{{ else }}0{{ end }}">{{ . }}</option>
+        {{ end }}
+      </optgroup>
+      {{ end }}
+    </select>
+  </label>
   <fieldset>
     <legend>Credential source</legend>
-    <label><input type="radio" name="cred_kind" value="byo_key" checked> BYO API key (set via "set key" after add)</label>
-    <label><input type="radio" name="cred_kind" value="oauth"> OAuth (managed by <code>opencode auth login</code>, see <a href="/oauth">oauth page</a>)</label>
+    <label><input type="radio" name="cred_kind" value="byo_key" id="cred-byo" checked> BYO API key (set via "set key" after add)</label>
+    <label><input type="radio" name="cred_kind" value="oauth" id="cred-oauth"> OAuth (managed by <code>opencode auth login</code>, see <a href="/oauth">oauth page</a>)</label>
   </fieldset>
-  <label>env var name (BYO only — ignored for OAuth) <input name="env_key" placeholder="ANTHROPIC_API_KEY"></label>
+  <p class="muted" id="env-hint">env var: <code id="env-display">—</code> (auto-filled from selected model)</p>
   <button>add</button>
 </form>
+<script>
+(function(){
+  var sel = document.getElementById('model-select');
+  var byo = document.getElementById('cred-byo');
+  var oauth = document.getElementById('cred-oauth');
+  var envDisp = document.getElementById('env-display');
+  function sync(){
+    var opt = sel.options[sel.selectedIndex];
+    var env = opt ? opt.getAttribute('data-env') : '';
+    var oa = opt && opt.getAttribute('data-oauth') === '1';
+    envDisp.textContent = env || '— (OAuth-only)';
+    oauth.disabled = !oa;
+    if (!oa && oauth.checked) byo.checked = true;
+    if (!env) { byo.disabled = true; oauth.checked = true; } else { byo.disabled = false; }
+  }
+  sel.addEventListener('change', sync);
+  sync();
+})();
+</script>
 {{ end }}`
 
 const threadsTpl = `{{ define "threads" }}

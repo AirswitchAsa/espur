@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/punny/espur/internal/opencode"
+	"github.com/punny/espur/internal/providers"
 	"github.com/punny/espur/internal/secrets"
 	"github.com/punny/espur/internal/store"
 	"github.com/punny/espur/internal/transcript"
@@ -138,6 +139,11 @@ type vendorRow struct {
 	Penalty    vendor.PenalizedSnapshot
 }
 
+type vendorsPage struct {
+	Rows      []vendorRow
+	Providers []providers.Provider
+}
+
 func (s *Server) vendorsList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vs, _ := s.db.ListVendors(ctx)
@@ -156,7 +162,7 @@ func (s *Server) vendorsList(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	}
-	s.render(w, "vendors", rows)
+	s.render(w, "vendors", vendorsPage{Rows: rows, Providers: providers.Catalog})
 }
 
 func (s *Server) vendorAdd(w http.ResponseWriter, r *http.Request) {
@@ -179,9 +185,21 @@ func (s *Server) vendorAdd(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "vendor_id and model required", 400)
 		return
 	}
-	if credKind == "byo_key" && envKey == "" {
-		http.Error(w, "env_key required for BYO API key vendors", 400)
+	prov, _ := providers.Lookup(model)
+	if prov == nil {
+		http.Error(w, "model not in curated catalog: "+model, 400)
 		return
+	}
+	if credKind == "oauth" && !prov.SupportsOAuth {
+		http.Error(w, "provider "+prov.ID+" does not support OAuth", 400)
+		return
+	}
+	if credKind == "byo_key" {
+		if prov.EnvKey == "" {
+			http.Error(w, "provider "+prov.ID+" is OAuth-only", 400)
+			return
+		}
+		envKey = prov.EnvKey
 	}
 	ctx := r.Context()
 	vs, _ := s.db.ListVendors(ctx)

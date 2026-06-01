@@ -8,6 +8,7 @@ data/
 # secrets / local env
 .env
 .env.*
+.master-key
 
 # build artifacts
 bin/

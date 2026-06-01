@@ -3,6 +3,7 @@ package vendor
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,20 +140,26 @@ func TestRun_AllDrained_NothingEligible(t *testing.T) {
 }
 
 func TestClassify_Buckets(t *testing.T) {
+	// Inputs mirror real `opencode run --format json` error events: a JSON line
+	// carrying a top-level `error` object. Only this envelope is classified.
+	errEvent := func(data string) string {
+		return `{"type":"error","sessionID":"ses_x","error":{"name":"UnknownError","data":` + data + `}}`
+	}
 	cases := []struct {
 		name string
 		in   string
 		want FailureClass
 	}{
-		{"rate", `"message":"rate limit"`, ClassRateLimit},
-		{"429", `statusCode 429`, ClassRateLimit},
-		{"quota", `quota exceeded`, ClassRateLimit},
-		{"5xx", `"statusCode":503`, ClassServer5xx},
-		{"auth-phrase", `invalid api key`, ClassAuth},
-		{"401-http", `"statusCode":401`, ClassAuth},
-		{"opencode-model-not-found", `Model not found: openai/gpt-4o-mini. Did you mean: gpt-4o-mini?`, ClassAuth},
-		{"opencode-unknown-provider", `unknown provider for some-model`, ClassAuth},
-		{"clean", `here is your answer`, ClassNone},
+		{"rate", errEvent(`{"message":"rate limit"}`), ClassRateLimit},
+		{"429", errEvent(`{"statusCode":429,"message":"too many"}`), ClassRateLimit},
+		{"quota", errEvent(`{"message":"quota exceeded"}`), ClassRateLimit},
+		{"5xx", errEvent(`{"statusCode":503,"message":"bad gateway"}`), ClassServer5xx},
+		{"auth-phrase", errEvent(`{"message":"invalid api key"}`), ClassAuth},
+		{"401-http", errEvent(`{"statusCode":401,"message":"unauthorized"}`), ClassAuth},
+		{"opencode-model-not-found", errEvent(`{"message":"Model not found: openai/gpt-4o-mini. Did you mean: gpt-4o-mini?"}`), ClassAuth},
+		{"opencode-unknown-provider", errEvent(`{"message":"unknown provider for some-model"}`), ClassAuth},
+		{"clean-answer-event", `{"type":"text","part":{"text":"here is your answer"}}`, ClassNone},
+		{"non-json-fallback", `panic: runtime error: invalid api key`, ClassAuth},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -160,5 +167,25 @@ func TestClassify_Buckets(t *testing.T) {
 				t.Fatalf("Classify(%q) = %d, want %d", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// TestClassify_IgnoresToolOutput is the regression guard for the false
+// auth-lock bug: a healthy run whose web-search tool crawled pages returning
+// HTTP 401/403. Those errors live inside message parts, not opencode's error
+// envelope, so they must NOT classify as a vendor auth failure. (Two live
+// vendors were permanently auth-locked by exactly this on 2026-06-01.)
+func TestClassify_IgnoresToolOutput(t *testing.T) {
+	// A realistic mix: assistant text + a tool result carrying crawl errors,
+	// none of which is opencode's own error envelope.
+	stdout := strings.Join([]string{
+		`{"type":"step_start","sessionID":"ses_x","part":{"id":"p1"}}`,
+		`{"type":"tool","sessionID":"ses_x","part":{"tool":"webfetch","state":{"output":"{\"error\":{\"httpStatusCode\":401,\"tag\":\"CRAWL_HTTP_401\"}}"}}}`,
+		`{"type":"tool","sessionID":"ses_x","part":{"tool":"webfetch","state":{"output":"{\"httpStatusCode\":403,\"tag\":\"SOURCE_NOT_AVAILABLE\"}"}}}`,
+		`{"type":"text","sessionID":"ses_x","part":{"text":"The site returned 403 Forbidden and an unauthorized 401, see https://x.com/a401b403."}}`,
+		`{"type":"step_finish","sessionID":"ses_x","part":{"reason":"stop"}}`,
+	}, "\n")
+	if got := Classify(stdout, ""); got != ClassNone {
+		t.Fatalf("crawl-side HTTP 401/403 in tool output must not classify; got %d, want ClassNone", got)
 	}
 }

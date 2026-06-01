@@ -2,7 +2,12 @@
 // detection, fallthrough, and the penalty box. See docs/specs/vendor-pool.dog.md.
 package vendor
 
-import "strings"
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"strings"
+)
 
 // FailureClass is the bucket a single attempt falls into. Spec: vendor-pool.dog.md.
 type FailureClass int
@@ -67,11 +72,20 @@ var authPhrases = []string{
 	"no provider for",
 }
 
-// Classify inspects opencode's stdout (JSON event stream, often containing
-// upstream API errors verbatim) and stderr and returns the FailureClass.
-// On ClassNone the attempt is not eligible for fallthrough or penalty.
+// Classify decides the FailureClass for a crashed attempt. On ClassNone the
+// attempt is not eligible for fallthrough or penalty.
+//
+// Crucially, it inspects only opencode's *error envelope* — the
+// `{"type":"error",...,"error":{...}}` events on stdout (plus all of stderr) —
+// and never the assistant text or tool-result parts of the NDJSON stream.
+// A web-search tool that crawls a page returning HTTP 401/403 embeds strings
+// like `"httpStatusCode":401` / `"CRAWL_HTTP_401"` in a *message part*; scanning
+// the whole stream would read that website's rejection as the *vendor's* auth
+// failing and permanently auth-lock a perfectly healthy vendor. Scoping to the
+// error envelope is what keeps a crawl-side 401 from locking the pool.
+// See docs/specs/vendor-pool.dog.md and TestClassify_IgnoresToolOutput.
 func Classify(stdout, stderr string) FailureClass {
-	hay := strings.ToLower(stdout + "\n" + stderr)
+	hay := strings.ToLower(errorEnvelope(stdout) + "\n" + stderr)
 
 	// Auth wins over rate-limit when both phrases appear, since auth is
 	// permanent and warrants reconfigure, not a backoff.
@@ -98,6 +112,47 @@ func Classify(stdout, stderr string) FailureClass {
 		return ClassServer5xx
 	}
 	return ClassNone
+}
+
+// errorEnvelope distils opencode's NDJSON stdout down to just its error-bearing
+// content. `opencode run --format json` emits one JSON event per line; a
+// provider/runtime failure surfaces as an event carrying a top-level `error`
+// object (observed against opencode 1.15.x):
+//
+//	{"type":"error","sessionID":"...","error":{"name":"...","data":{"message":"...","statusCode":401}}}
+//
+// We keep only those error objects. Normal events (`text`, `tool`, `step_*`)
+// hold the assistant answer and tool results — including any HTTP errors a tool
+// hit while crawling — and are dropped so they can't trip the auth/rate-limit
+// phrase match. Lines that don't parse as JSON are kept verbatim: opencode's
+// own NDJSON is always valid, so a non-JSON line means abnormal output (a panic
+// or fatal log) worth classifying, and tool/web content never appears raw.
+func errorEnvelope(stdout string) string {
+	var b strings.Builder
+	sc := bufio.NewScanner(strings.NewReader(stdout))
+	// Match extractSessionID's bound: a single event line can be large.
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev map[string]json.RawMessage
+		if err := json.Unmarshal(line, &ev); err != nil {
+			b.Write(line)
+			b.WriteByte('\n')
+			continue
+		}
+		raw, ok := ev["error"]
+		if !ok {
+			continue
+		}
+		if s := strings.TrimSpace(string(raw)); s != "" && s != "null" {
+			b.WriteString(s)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
 }
 
 func has5xx(hay string) bool {

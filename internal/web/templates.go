@@ -81,9 +81,9 @@ const layout = `{{ define "layout" }}<!doctype html>
 {{ end }}
 `
 
-// homeTpl renders KPI tiles, the activity feed (empty state when we have no
-// invocation feed source yet — espur doesn't persist invocation history in
-// v0.1), and adapter cards.
+// homeTpl renders KPI tiles, the activity feed (recent bot replies aggregated
+// from per-thread transcripts by Server.recentFeed; empty state shown only when
+// no thread has produced a reply yet), and adapter cards.
 const homeTpl = `{{ define "home" }}
 <div class="es-page">
   <div class="es-phead">
@@ -133,7 +133,7 @@ const homeTpl = `{{ define "home" }}
           <span class="es-plat">{{ if eq .Platform "discord" }}{{ template "icon-hash" }}{{ else }}{{ template "icon-msg" }}{{ end }}</span>
           <div class="es-feed__main">
             <span class="es-feed__thread">{{ .ThreadLabel }}</span>
-            <span class="es-feed__vendor">{{ .Vendor }}</span>
+            <span class="es-feed__vendor">{{ if .Vendor }}{{ .Vendor }}{{ if .Outcome }} · {{ end }}{{ end }}{{ if .Outcome }}<span{{ if ne .Outcome "success" }} style="color: var(--danger)"{{ end }}>{{ .Outcome }}</span>{{ end }}</span>
           </div>
           <div class="es-feed__meta">
             <span>{{ .Ago }}</span>

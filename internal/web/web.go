@@ -209,6 +209,7 @@ type feedItem struct {
 	EncID       string
 	ThreadLabel string
 	Vendor      string
+	Outcome     string // reply_outcome: success | timeout | drained | crash
 	Ago         string
 }
 
@@ -292,9 +293,65 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 		Uptime:        humanDuration(time.Since(startTime)),
 		Adapters:      adapters,
 		Rotation:      rotation,
-		Feed:          nil, // no invocation history yet — leave empty for honest UI
+		Feed:          s.recentFeed(20),
 	}
 	s.render(w, "home", page)
+}
+
+// recentFeed aggregates the most recent bot replies across all thread
+// transcripts into one recency-sorted feed for the home page. Each bot record
+// carries its vendor and reply outcome in meta, which we surface. Reads are
+// best-effort: missing or malformed transcripts are skipped. We tail a bounded
+// slice per thread so the scan stays cheap regardless of transcript length.
+func (s *Server) recentFeed(n int) []feedItem {
+	root := filepath.Join(s.ts.BaseDir, "threads")
+	type entry struct {
+		item feedItem
+		ts   time.Time
+	}
+	var entries []entry
+	platforms, _ := os.ReadDir(root)
+	for _, pf := range platforms {
+		if !pf.IsDir() {
+			continue
+		}
+		threads, _ := os.ReadDir(filepath.Join(root, pf.Name()))
+		for _, th := range threads {
+			if !th.IsDir() {
+				continue
+			}
+			recs, _ := tailJSONL(filepath.Join(root, pf.Name(), th.Name(), "transcript.jsonl"), 50)
+			for _, r := range recs {
+				if r.Kind != transcript.KindBot {
+					continue
+				}
+				ts, err := time.Parse(time.RFC3339Nano, r.TS)
+				if err != nil {
+					continue
+				}
+				entries = append(entries, entry{
+					item: feedItem{
+						Platform:    pf.Name(),
+						EncID:       th.Name(),
+						ThreadLabel: th.Name(),
+						Vendor:      r.Meta.VendorID,
+						Outcome:     r.Meta.ReplyOutcome,
+						Ago:         humanTime(ts),
+					},
+					ts: ts,
+				})
+			}
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ts.After(entries[j].ts) })
+	if len(entries) > n {
+		entries = entries[:n]
+	}
+	out := make([]feedItem, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.item)
+	}
+	return out
 }
 
 // ---------- vendors ----------

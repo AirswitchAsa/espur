@@ -136,15 +136,16 @@ func TestInvoke_Fake_Success(t *testing.T) {
 	}
 }
 
-func TestInvoke_Fake_TextFromStdout(t *testing.T) {
-	// stdout carries the answer as a type:text event. Export is deliberately
-	// left to fail (empty FAKE_OC_EXPORT) — success proves the text came from
-	// stdout and export was never consulted.
+func TestInvoke_Fake_PrefersExportOverStdout(t *testing.T) {
+	// Regression guard: stdout carries only a preamble (opencode dropped the
+	// trailing answer event), while export holds the real final answer. Export
+	// must win — otherwise the preamble would be served as the reply.
 	res, err := Invoke(context.Background(), Request{
 		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
-			"FAKE_OC_STDOUT": `{"type":"step_start","sessionID":"ses_so"}` + "\n" +
-				`{"type":"text","sessionID":"ses_so","part":{"id":"p1","messageID":"m1","type":"text","text":"answer from stdout"}}` + "\n",
-			"FAKE_OC_EXIT": "0",
+			"FAKE_OC_STDOUT": `{"type":"step_start","sessionID":"ses_pre"}` + "\n" +
+				`{"type":"text","sessionID":"ses_pre","part":{"id":"p1","messageID":"m1","type":"text","text":"let me look into it"}}` + "\n",
+			"FAKE_OC_EXPORT": `{"messages":[{"info":{"role":"assistant"},"parts":[{"type":"text","text":"the real final answer"}]}]}`,
+			"FAKE_OC_EXIT":   "0",
 		})},
 		WorkDir: t.TempDir(), UserMsg: "x",
 		Timeout: 5 * time.Second, BinPath: fakeBin(t),
@@ -152,31 +153,54 @@ func TestInvoke_Fake_TextFromStdout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if res.Outcome != OutcomeSuccess || res.AssistantText != "answer from stdout" {
+	if res.Outcome != OutcomeSuccess || res.AssistantText != "the real final answer" {
+		t.Fatalf("outcome=%s text=%q (want export answer, not stdout preamble)", res.Outcome, res.AssistantText)
+	}
+}
+
+func TestInvoke_Fake_StdoutFallbackWhenExportUnavailable(t *testing.T) {
+	// Export never returns usable JSON (every attempt empty → unmarshal fails);
+	// stdout carried the answer. After exhausting export retries we fall back to
+	// stdout rather than dropping a turn that did produce an answer.
+	res, err := Invoke(context.Background(), Request{
+		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
+			"FAKE_OC_STDOUT": `{"type":"step_start","sessionID":"ses_fb"}` + "\n" +
+				`{"type":"text","sessionID":"ses_fb","part":{"id":"p1","messageID":"m1","type":"text","text":"answer from stdout fallback"}}` + "\n",
+			// no FAKE_OC_EXPORT → export prints nothing → unmarshal fails each attempt
+			"FAKE_OC_EXIT": "0",
+		})},
+		WorkDir: t.TempDir(), UserMsg: "x",
+		Timeout: 10 * time.Second, BinPath: fakeBin(t),
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Outcome != OutcomeSuccess || res.AssistantText != "answer from stdout fallback" {
 		t.Fatalf("outcome=%s reason=%s text=%q", res.Outcome, res.CrashReason, res.AssistantText)
 	}
 }
 
-func TestInvoke_Fake_StdoutPrefersLastMessageConcatParts(t *testing.T) {
-	// Two assistant messages stream text; the final answer is the last
-	// message's parts, concatenated in order (an earlier reasoning step is
-	// dropped, matching export semantics).
-	res, err := Invoke(context.Background(), Request{
-		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
-			"FAKE_OC_STDOUT": `{"type":"step_start","sessionID":"ses_ml"}` + "\n" +
-				`{"type":"text","sessionID":"ses_ml","part":{"id":"p1","messageID":"m1","type":"text","text":"reasoning step"}}` + "\n" +
-				`{"type":"text","sessionID":"ses_ml","part":{"id":"p2","messageID":"m2","type":"text","text":"final "}}` + "\n" +
-				`{"type":"text","sessionID":"ses_ml","part":{"id":"p3","messageID":"m2","type":"text","text":"answer"}}` + "\n",
-			"FAKE_OC_EXIT": "0",
-		})},
-		WorkDir: t.TempDir(), UserMsg: "x",
-		Timeout: 5 * time.Second, BinPath: fakeBin(t),
-	})
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
+func TestAssistantTextFromStdout(t *testing.T) {
+	ev := func(mid, pid, text string) string {
+		return `{"type":"text","sessionID":"s","part":{"id":"` + pid + `","messageID":"` + mid + `","type":"text","text":"` + text + `"}}`
 	}
-	if res.Outcome != OutcomeSuccess || res.AssistantText != "final answer" {
-		t.Fatalf("outcome=%s text=%q", res.Outcome, res.AssistantText)
+	cases := []struct{ name, in, want string }{
+		{"single part", ev("m1", "p1", "hello"), "hello"},
+		{"last message wins, its parts concatenated",
+			ev("m1", "p1", "preamble") + "\n" + ev("m2", "p2", "final ") + "\n" + ev("m2", "p3", "answer"),
+			"final answer"},
+		{"streamed part collapses to final value",
+			ev("m1", "p1", "par") + "\n" + ev("m1", "p1", "partial done"),
+			"partial done"},
+		{"no text events", `{"type":"step_start","sessionID":"s","part":{"id":"x"}}`, ""},
+		{"ignores non-text parts", `{"type":"text","part":{"type":"reasoning","text":"think"}}` + "\n" + ev("m1", "p1", "real"), "real"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := assistantTextFromStdout(c.in); got != c.want {
+				t.Fatalf("assistantTextFromStdout = %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 

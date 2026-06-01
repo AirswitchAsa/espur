@@ -194,31 +194,35 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 		return res, nil
 	}
 
-	// Prefer the assistant text straight from the run's stdout. `opencode run
-	// --format json` emits the final answer as {"type":"text",...} events, so
-	// the common path needs no second process at all.
+	// The session export is the authoritative source for the assistant answer:
+	// it always holds the final message, including when opencode drops the
+	// trailing text event from the run's stdout. Trusting stdout alone is unsafe
+	// — when that trailing event is dropped, an earlier text part (e.g. the
+	// model's "let me look into it" preamble) survives and would be served as if
+	// it were the answer. Export can come back empty for a beat right after the
+	// run while the freshly-written session settles in opencode's store, so it
+	// retries (see exportAssistantTextRetry). Only if export can't be retrieved
+	// at all do we fall back to whatever text the run streamed to stdout — better
+	// a possibly-partial reply than dropping a turn that did produce an answer.
 	//
-	// Only when stdout carries no text do we fall back to `opencode export`:
-	// opencode 1.15.x intermittently drops the trailing text event from stdout
-	// (the session record still has it). Export is authoritative but racy right
-	// after a run — reading the freshly-written session from a fresh process can
-	// return empty for a beat, and that settle window grows with session size.
-	// Reading stdout first sidesteps that race for every normal turn; the
-	// fallback (with retries) covers the rare dropped-event case. Historically
-	// this was export-first, which is what made large research turns crash with
-	// "export: unexpected end of JSON input" despite a complete answer.
-	text := assistantTextFromStdout(res.Stdout)
+	// Derive export's context from the caller's, not runCtx: if `opencode run`
+	// finished right at the deadline, runCtx may already be canceled, and
+	// exec.CommandContext would kill `opencode export` before it prints anything.
+	text, exportErr := exportAssistantTextRetry(ctx, bin, sessionID, req.Vendor.CredEnv)
 	if strings.TrimSpace(text) == "" {
-		var exportErr error
-		text, exportErr = exportAssistantTextRetry(ctx, bin, sessionID, req.Vendor.CredEnv)
+		if stdoutText := assistantTextFromStdout(res.Stdout); strings.TrimSpace(stdoutText) != "" {
+			text = stdoutText
+		}
+	}
+	if strings.TrimSpace(text) == "" {
+		// Nothing from either source. Distinguish a hard export failure from a
+		// run that simply produced no assistant text (spec: "A zero exit code
+		// with no usable assistant text is also a crash").
 		if exportErr != nil {
 			res.Outcome = OutcomeCrash
 			res.CrashReason = "export_failed"
 			return res, exportErr
 		}
-	}
-	if strings.TrimSpace(text) == "" {
-		// Spec: "A zero exit code with no usable assistant text is also a crash."
 		res.Outcome = OutcomeCrash
 		res.CrashReason = "no_assistant_text"
 		return res, nil
@@ -325,8 +329,13 @@ type stdoutTextEvent struct {
 // message wins" semantics. Text parts are keyed by part id (last value wins, so
 // a part that streams updates collapses to its final form) and grouped by
 // message id; the parts of the last message to emit text are concatenated in
-// first-seen order. Returns "" when stdout carries no text part — opencode
-// occasionally omits it, and the caller then falls back to the session export.
+// first-seen order.
+//
+// This is only a fallback for when the session export can't be retrieved: it is
+// NOT a reliable source on its own, because opencode intermittently drops the
+// trailing text event, leaving the last surviving text part an earlier
+// (e.g. preamble) message rather than the real answer. Returns "" when stdout
+// carries no text part at all.
 func assistantTextFromStdout(stdout string) string {
 	var lastMsg string
 	textByPart := map[string]map[string]string{} // messageID -> partID -> text

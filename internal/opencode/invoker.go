@@ -28,7 +28,20 @@ const DefaultKillGrace = 5 * time.Second
 // DefaultExportTimeout caps `opencode export` independently of the run
 // timeout. Export is a local DB read — sub-second in practice — so a tight
 // budget is fine and prevents long-tail run completions from starving export.
+// It bounds the whole retry sequence below, not a single attempt.
 const DefaultExportTimeout = 30 * time.Second
+
+// Export retry tuning. `opencode export` is only a fallback now (assistant text
+// normally comes straight from run stdout), but when used it occasionally
+// returns nothing in the instant after `opencode run` exits — the just-written
+// session hasn't settled in opencode's SQLite store yet, and that window grows
+// with session size. Retry with escalating backoff (≈6s total over 5 attempts)
+// so a slow-settling large session still resolves instead of crashing. The
+// whole sequence stays bounded by DefaultExportTimeout.
+const (
+	exportMaxAttempts  = 5
+	exportRetryBackoff = 400 * time.Millisecond
+)
 
 // Outcome enumerates the terminal categories defined in
 // docs/specs/opencode-invoke.dog.md ("Outcome"). Vendor-fallthrough categories
@@ -181,22 +194,28 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 		return res, nil
 	}
 
-	// `opencode run --format json` streams NDJSON events on stdout but, as of
-	// opencode 1.15.11, intermittently drops the trailing `type=text` event
-	// (the session record has the text — stdout doesn't). The session export
-	// is authoritative, so we pull assistant text from there.
+	// Prefer the assistant text straight from the run's stdout. `opencode run
+	// --format json` emits the final answer as {"type":"text",...} events, so
+	// the common path needs no second process at all.
 	//
-	// Use a fresh context derived from the caller's, not runCtx: if
-	// `opencode run` finished right at the deadline, runCtx may already be
-	// canceled, and exec.CommandContext would kill `opencode export` before it
-	// prints anything (manifests as "parse: unexpected end of JSON input").
-	exportCtx, exportCancel := context.WithTimeout(ctx, DefaultExportTimeout)
-	defer exportCancel()
-	text, exportErr := exportAssistantText(exportCtx, bin, sessionID, req.Vendor.CredEnv)
-	if exportErr != nil {
-		res.Outcome = OutcomeCrash
-		res.CrashReason = "export_failed"
-		return res, exportErr
+	// Only when stdout carries no text do we fall back to `opencode export`:
+	// opencode 1.15.x intermittently drops the trailing text event from stdout
+	// (the session record still has it). Export is authoritative but racy right
+	// after a run — reading the freshly-written session from a fresh process can
+	// return empty for a beat, and that settle window grows with session size.
+	// Reading stdout first sidesteps that race for every normal turn; the
+	// fallback (with retries) covers the rare dropped-event case. Historically
+	// this was export-first, which is what made large research turns crash with
+	// "export: unexpected end of JSON input" despite a complete answer.
+	text := assistantTextFromStdout(res.Stdout)
+	if strings.TrimSpace(text) == "" {
+		var exportErr error
+		text, exportErr = exportAssistantTextRetry(ctx, bin, sessionID, req.Vendor.CredEnv)
+		if exportErr != nil {
+			res.Outcome = OutcomeCrash
+			res.CrashReason = "export_failed"
+			return res, exportErr
+		}
 	}
 	if strings.TrimSpace(text) == "" {
 		// Spec: "A zero exit code with no usable assistant text is also a crash."
@@ -287,6 +306,100 @@ type ocExport struct {
 			Text string `json:"text"`
 		} `json:"parts"`
 	} `json:"messages"`
+}
+
+// stdoutTextEvent mirrors the {"type":"text",...,"part":{...}} events
+// `opencode run --format json` writes for assistant text parts.
+type stdoutTextEvent struct {
+	Type string `json:"type"`
+	Part struct {
+		ID        string `json:"id"`
+		MessageID string `json:"messageID"`
+		Type      string `json:"type"`
+		Text      string `json:"text"`
+	} `json:"part"`
+}
+
+// assistantTextFromStdout reconstructs the final assistant message's text from
+// the run's NDJSON stdout, mirroring exportAssistantText's "last assistant
+// message wins" semantics. Text parts are keyed by part id (last value wins, so
+// a part that streams updates collapses to its final form) and grouped by
+// message id; the parts of the last message to emit text are concatenated in
+// first-seen order. Returns "" when stdout carries no text part — opencode
+// occasionally omits it, and the caller then falls back to the session export.
+func assistantTextFromStdout(stdout string) string {
+	var lastMsg string
+	textByPart := map[string]map[string]string{} // messageID -> partID -> text
+	partOrder := map[string][]string{}            // messageID -> partID order
+	sc := bufio.NewScanner(strings.NewReader(stdout))
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev stdoutTextEvent
+		if json.Unmarshal(line, &ev) != nil {
+			continue
+		}
+		if ev.Type != "text" || ev.Part.Type != "text" || ev.Part.Text == "" {
+			continue
+		}
+		mid := ev.Part.MessageID
+		if textByPart[mid] == nil {
+			textByPart[mid] = map[string]string{}
+		}
+		if _, seen := textByPart[mid][ev.Part.ID]; !seen {
+			partOrder[mid] = append(partOrder[mid], ev.Part.ID)
+		}
+		textByPart[mid][ev.Part.ID] = ev.Part.Text
+		lastMsg = mid
+	}
+	if lastMsg == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, pid := range partOrder[lastMsg] {
+		b.WriteString(textByPart[lastMsg][pid])
+	}
+	return b.String()
+}
+
+// exportAssistantTextRetry pulls the assistant text from the session export,
+// retrying on failure or empty output. `opencode export` is a read-only,
+// idempotent DB read, but run in the instant after `opencode run` exits it
+// occasionally crashes or returns nothing: the just-written session hasn't
+// fully settled in opencode's SQLite store yet (observed against opencode
+// 1.15.13 — a heavy research turn produced a full answer, yet the immediate
+// export failed while exporting the same session a moment later succeeded).
+// A short backoff between attempts converts that transient into a delivered
+// reply rather than an export_failed crash.
+//
+// The whole sequence is bounded by DefaultExportTimeout (attempts share one
+// budget, so worst-case latency matches the old single-shot path). The last
+// attempt's (text, err) is returned verbatim so the caller still distinguishes
+// export_failed (err != nil) from no_assistant_text (empty text, no err).
+func exportAssistantTextRetry(parent context.Context, bin, sessionID string, creds map[string]string) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, DefaultExportTimeout)
+	defer cancel()
+	var (
+		text string
+		err  error
+	)
+	for attempt := 0; attempt < exportMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return text, err // out of budget — surface the last attempt's result
+			case <-time.After(time.Duration(attempt) * exportRetryBackoff):
+			}
+		}
+		text, err = exportAssistantText(ctx, bin, sessionID, creds)
+		if err == nil && strings.TrimSpace(text) != "" {
+			return text, nil
+		}
+	}
+	return text, err
 }
 
 func exportAssistantText(ctx context.Context, bin, sessionID string, creds map[string]string) (string, error) {

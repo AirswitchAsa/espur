@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,26 @@ func runFakeOpencode() {
 			fmt.Fprint(os.Stdout, s)
 		}
 	case "export":
+		// Optional transient injection: fail the first N export attempts to
+		// exercise the retry wrapper. Each export is a fresh process, so the
+		// attempt count is tracked in a counter file. A "failure" is empty
+		// stdout + exit 0, which makes exportAssistantText's json.Unmarshal err
+		// — the same shape as the real post-run transient.
+		if cf := os.Getenv("FAKE_OC_COUNTER_FILE"); cf != "" {
+			n := 0
+			if b, err := os.ReadFile(cf); err == nil {
+				_, _ = fmt.Sscanf(string(b), "%d", &n)
+			}
+			n++
+			_ = os.WriteFile(cf, []byte(fmt.Sprintf("%d", n)), 0o644)
+			failTimes := 0
+			if s := os.Getenv("FAKE_OC_EXPORT_FAIL_TIMES"); s != "" {
+				_, _ = fmt.Sscanf(s, "%d", &failTimes)
+			}
+			if n <= failTimes {
+				os.Exit(0) // empty stdout → parse failure in the caller
+			}
+		}
 		if s := os.Getenv("FAKE_OC_EXPORT"); s != "" {
 			fmt.Fprint(os.Stdout, s)
 		}
@@ -115,6 +136,50 @@ func TestInvoke_Fake_Success(t *testing.T) {
 	}
 }
 
+func TestInvoke_Fake_TextFromStdout(t *testing.T) {
+	// stdout carries the answer as a type:text event. Export is deliberately
+	// left to fail (empty FAKE_OC_EXPORT) — success proves the text came from
+	// stdout and export was never consulted.
+	res, err := Invoke(context.Background(), Request{
+		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
+			"FAKE_OC_STDOUT": `{"type":"step_start","sessionID":"ses_so"}` + "\n" +
+				`{"type":"text","sessionID":"ses_so","part":{"id":"p1","messageID":"m1","type":"text","text":"answer from stdout"}}` + "\n",
+			"FAKE_OC_EXIT": "0",
+		})},
+		WorkDir: t.TempDir(), UserMsg: "x",
+		Timeout: 5 * time.Second, BinPath: fakeBin(t),
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Outcome != OutcomeSuccess || res.AssistantText != "answer from stdout" {
+		t.Fatalf("outcome=%s reason=%s text=%q", res.Outcome, res.CrashReason, res.AssistantText)
+	}
+}
+
+func TestInvoke_Fake_StdoutPrefersLastMessageConcatParts(t *testing.T) {
+	// Two assistant messages stream text; the final answer is the last
+	// message's parts, concatenated in order (an earlier reasoning step is
+	// dropped, matching export semantics).
+	res, err := Invoke(context.Background(), Request{
+		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
+			"FAKE_OC_STDOUT": `{"type":"step_start","sessionID":"ses_ml"}` + "\n" +
+				`{"type":"text","sessionID":"ses_ml","part":{"id":"p1","messageID":"m1","type":"text","text":"reasoning step"}}` + "\n" +
+				`{"type":"text","sessionID":"ses_ml","part":{"id":"p2","messageID":"m2","type":"text","text":"final "}}` + "\n" +
+				`{"type":"text","sessionID":"ses_ml","part":{"id":"p3","messageID":"m2","type":"text","text":"answer"}}` + "\n",
+			"FAKE_OC_EXIT": "0",
+		})},
+		WorkDir: t.TempDir(), UserMsg: "x",
+		Timeout: 5 * time.Second, BinPath: fakeBin(t),
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Outcome != OutcomeSuccess || res.AssistantText != "final answer" {
+		t.Fatalf("outcome=%s text=%q", res.Outcome, res.AssistantText)
+	}
+}
+
 func TestInvoke_Fake_NoParseableJSON(t *testing.T) {
 	res, _ := Invoke(context.Background(), Request{
 		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
@@ -161,6 +226,58 @@ func TestInvoke_Fake_ExportFails(t *testing.T) {
 	})
 	if res.Outcome != OutcomeCrash || res.CrashReason != "export_failed" {
 		t.Fatalf("outcome=%s reason=%s", res.Outcome, res.CrashReason)
+	}
+}
+
+func TestInvoke_Fake_ExportRetrySucceeds(t *testing.T) {
+	// First 2 export attempts fail (transient); the 3rd succeeds. With
+	// exportMaxAttempts=3 the wrapper should recover and deliver the text.
+	counter := filepath.Join(t.TempDir(), "export-attempts")
+	res, err := Invoke(context.Background(), Request{
+		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
+			"FAKE_OC_STDOUT":            `{"type":"step_start","sessionID":"ses_retry"}` + "\n",
+			"FAKE_OC_EXPORT":            `{"messages":[{"info":{"role":"assistant"},"parts":[{"type":"text","text":"recovered answer"}]}]}`,
+			"FAKE_OC_COUNTER_FILE":      counter,
+			"FAKE_OC_EXPORT_FAIL_TIMES": "2",
+			"FAKE_OC_EXIT":              "0",
+		})},
+		WorkDir: t.TempDir(), UserMsg: "x",
+		Timeout: 5 * time.Second, BinPath: fakeBin(t),
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Outcome != OutcomeSuccess || res.AssistantText != "recovered answer" {
+		t.Fatalf("outcome=%s reason=%s text=%q", res.Outcome, res.CrashReason, res.AssistantText)
+	}
+}
+
+func TestInvoke_Fake_ExportRetryExhausted(t *testing.T) {
+	// Every attempt fails (FAIL_TIMES exceeds exportMaxAttempts) → export_failed.
+	counter := filepath.Join(t.TempDir(), "export-attempts")
+	res, _ := Invoke(context.Background(), Request{
+		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
+			"FAKE_OC_STDOUT":            `{"type":"step_start","sessionID":"ses_retry_x"}` + "\n",
+			"FAKE_OC_EXPORT":            `{"messages":[{"info":{"role":"assistant"},"parts":[{"type":"text","text":"never reached"}]}]}`,
+			"FAKE_OC_COUNTER_FILE":      counter,
+			"FAKE_OC_EXPORT_FAIL_TIMES": "99",
+			"FAKE_OC_EXIT":              "0",
+		})},
+		WorkDir: t.TempDir(), UserMsg: "x",
+		Timeout: 5 * time.Second, BinPath: fakeBin(t),
+	})
+	if res.Outcome != OutcomeCrash || res.CrashReason != "export_failed" {
+		t.Fatalf("outcome=%s reason=%s", res.Outcome, res.CrashReason)
+	}
+	// Confirm it actually retried the full budget rather than giving up early.
+	if b, err := os.ReadFile(counter); err == nil {
+		var n int
+		_, _ = fmt.Sscanf(string(b), "%d", &n)
+		if n != exportMaxAttempts {
+			t.Fatalf("expected %d export attempts, got %d", exportMaxAttempts, n)
+		}
+	} else {
+		t.Fatalf("counter file unreadable: %v", err)
 	}
 }
 

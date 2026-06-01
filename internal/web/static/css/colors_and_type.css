@@ -1,0 +1,210 @@
+/* =============================================================================
+   Spicadust Design System — Colors + Type
+   Built on the Nihon palette mappings declared in design.md §3.5 and §9.
+   ============================================================================= */
+
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+/* Courier Prime — used ONLY for the wordmark / logo. Self-hosted. */
+@font-face {
+  font-family: 'Courier Prime';
+  src: url('/static/fonts/CourierPrime-Regular.ttf') format('truetype');
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Courier Prime';
+  src: url('/static/fonts/CourierPrime-Italic.ttf') format('truetype');
+  font-weight: 400; font-style: italic; font-display: swap;
+}
+@font-face {
+  font-family: 'Courier Prime';
+  src: url('/static/fonts/CourierPrime-Bold.ttf') format('truetype');
+  font-weight: 700; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Courier Prime';
+  src: url('/static/fonts/CourierPrime-BoldItalic.ttf') format('truetype');
+  font-weight: 700; font-style: italic; font-display: swap;
+}
+
+/* -----------------------------------------------------------------------------
+   Type primitives
+   ----------------------------------------------------------------------------- */
+:root {
+  /* Geist for prose; IBM Plex Mono for mono; Courier Prime for the LOGO ONLY. */
+  --ds-font-sans: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --ds-font-mono: 'IBM Plex Mono', ui-monospace, 'Fira Code', Menlo, Monaco, 'Courier New', monospace;
+  --ds-font-mark: 'Courier Prime', 'Courier New', ui-monospace, monospace;
+
+  /* Type scale */
+  --ds-text-2xs: 11px;
+  --ds-text-xs: 12px;
+  --ds-text-sm: 13px;
+  --ds-text-base: 14px;
+  --ds-text-body: 14px;
+  --ds-text-md: 16px;
+  --ds-text-lg: 18px;
+  --ds-text-xl: 22px;
+  --ds-text-2xl: 28px;
+  --ds-text-3xl: 36px;
+  --ds-text-display: clamp(38px, 5vw, 56px);
+
+  /* Weight */
+  --ds-weight-regular: 400;
+  --ds-weight-medium: 500;
+  --ds-weight-semibold: 600;
+
+  /* Tracking */
+  --ds-tracking-tight: -0.02em;
+  --ds-tracking-snug: -0.01em;
+  --ds-tracking-normal: 0;
+  --ds-tracking-wide: 0.05em;
+  --ds-tracking-wider: 0.14em;
+
+  /* Leading */
+  --ds-leading-tight: 1.05;
+  --ds-leading-snug: 1.2;
+  --ds-leading-normal: 1.55;
+  --ds-leading-relaxed: 1.65;
+
+  /* Spacing scale (4px base) */
+  --ds-space-0: 0;
+  --ds-space-1: 4px;
+  --ds-space-2: 8px;
+  --ds-space-3: 12px;
+  --ds-space-4: 16px;
+  --ds-space-5: 24px;
+  --ds-space-6: 32px;
+  --ds-space-7: 48px;
+  --ds-space-8: 64px;
+  --ds-space-9: 96px;
+  --ds-space-10: 128px;
+  --ds-space-11: 160px;
+  --ds-space-12: 192px;
+
+  /* Radius — pill / circle / sharp / large; the 4-8px middle is forbidden. */
+  --ds-radius-none: 0;
+  --ds-radius-pill: 999px;
+  --ds-radius-circle: 50%;
+  --ds-radius-lg: 16px;
+
+  /* Borders */
+  --ds-border-width: 1px;
+  --ds-border-width-strong: 2px;
+
+  /* Motion */
+  --ds-motion-fast: 80ms;
+  --ds-motion-base: 150ms;
+  --ds-motion-slow: 300ms;
+  --ds-ease-standard: cubic-bezier(.2, .7, .3, 1);
+  --ds-ease-emphasized: cubic-bezier(.22, 1, .36, 1);
+}
+
+/* -----------------------------------------------------------------------------
+   Color roles — every role is a LIGHT/DARK PAIR.
+   Each role is declared exactly twice: once on :root (light), once on
+   [data-theme="dark"]/.dark — in the SAME order, grouped by purpose.
+   Edit pairs together; never add a role to one block without the other.
+   Nihon names appear inline as comments next to the value they describe.
+   ----------------------------------------------------------------------------- */
+
+/* LIGHT (default) ---------------------------------------------------------- */
+:root,
+:root[data-theme="light"] {
+  /* Surfaces */
+  --paper:         #ffffff;          /* base canvas */
+  --paper-soft:    #fffffc;          /* 生成色 — raised: cards, sidebars */
+  --paper-grey:    #f9f9f9;          /* selection, focused field, inline panel */
+  --paper-inverse: #2b2b2b;          /* inverted surface */
+  --canvas:        #fffffc;          /* sphaere-only inner canvas */
+
+  /* Ink */
+  --ink:           #2b2b2b;
+  --ink-soft:      #595857;
+  --muted:         #727171;
+
+  /* Lines */
+  --line:          #e5e4e6;
+  --line-strong:   #dcdddd;
+
+  /* Action */
+  --action:        #164a84;          /* 紺瑠璃 */
+  --action-ink:    #ffffff;
+  --action-soft:   #d6e3f2;          /* 月白 */
+
+  /* Status */
+  --system:        #478384;          /* 青碧 */
+  --danger:        #b3424a;          /* 真紅 */
+  --favorite:      #e8b04b;          /* 山吹色 */
+  --warning:       #e8b04b;          /* (= favorite) */
+  --info:          #164a84;          /* (= action) */
+
+  color-scheme: light;
+}
+
+/* DARK --------------------------------------------------------------------- */
+:root[data-theme="dark"],
+.dark {
+  /* Surfaces */
+  --paper:         #2b2b2b;
+  --paper-soft:    #353535;
+  --paper-grey:    #474a4d;
+  --paper-inverse: #fffffc;
+  --canvas:        #2b2b2b;
+
+  /* Ink */
+  --ink:           #ffffff;
+  --ink-soft:      #dcdddd;
+  --muted:         #afafb0;
+
+  /* Lines */
+  --line:          #595857;
+  --line-strong:   #524e4d;
+
+  /* Action */
+  --action:        #89c3eb;          /* 勿忘草色 */
+  --action-ink:    #2b2b2b;
+  --action-soft:   #44617b;          /* 紺鼠 */
+
+  /* Status */
+  --system:        #38b48b;          /* 翡翠色 */
+  --danger:        #d69090;          /* 退紅 */
+  --favorite:      #fef263;          /* 黄柏色 */
+  --warning:       #fef263;          /* (= favorite) */
+  --info:          #89c3eb;          /* (= action) */
+
+  color-scheme: dark;
+}
+
+/* -----------------------------------------------------------------------------
+   Base type
+   ----------------------------------------------------------------------------- */
+html { font-family: var(--ds-font-sans); color: var(--ink); background: var(--paper); -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+body { font-family: var(--ds-font-sans); font-size: var(--ds-text-body); line-height: var(--ds-leading-normal); color: var(--ink); background: var(--paper); margin: 0; }
+
+/* -----------------------------------------------------------------------------
+   Semantic typography classes
+   Headings stop at text-3xl in app surfaces; reserve 4xl/5xl for marketing.
+   ----------------------------------------------------------------------------- */
+.ds-display { font-family: var(--ds-font-sans); font-size: var(--ds-text-display); font-weight: var(--ds-weight-medium); letter-spacing: var(--ds-tracking-tight); line-height: var(--ds-leading-tight); color: var(--ink); }
+.ds-h1 { font-family: var(--ds-font-sans); font-size: var(--ds-text-3xl); font-weight: var(--ds-weight-medium); letter-spacing: var(--ds-tracking-tight); line-height: var(--ds-leading-tight); color: var(--ink); }
+.ds-h2 { font-family: var(--ds-font-sans); font-size: var(--ds-text-2xl); font-weight: var(--ds-weight-medium); letter-spacing: var(--ds-tracking-tight); line-height: var(--ds-leading-snug); color: var(--ink); }
+.ds-h3 { font-family: var(--ds-font-sans); font-size: var(--ds-text-xl); font-weight: var(--ds-weight-medium); letter-spacing: var(--ds-tracking-snug); line-height: var(--ds-leading-snug); color: var(--ink); }
+
+.ds-body { font-family: var(--ds-font-sans); font-size: var(--ds-text-body); line-height: var(--ds-leading-normal); color: var(--ink); }
+.ds-small { font-size: var(--ds-text-sm); color: var(--ink-soft); line-height: var(--ds-leading-normal); }
+.ds-caption { font-size: var(--ds-text-sm); color: var(--muted); line-height: var(--ds-leading-normal); }
+
+/* Mono micro-labels — reserved for codes, IDs, specs, timestamps. */
+.ds-spec { font-family: var(--ds-font-mono); font-size: var(--ds-text-2xs); letter-spacing: var(--ds-tracking-wider); text-transform: uppercase; color: var(--muted); }
+.ds-spec--ink { color: var(--ink); }
+.ds-serial { font-family: var(--ds-font-mono); font-size: var(--ds-text-sm); color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+.ds-mono { font-family: var(--ds-font-mono); }
+.ds-num { font-variant-numeric: tabular-nums; }
+
+/* Hairline rule */
+.ds-rule { border: 0; border-top: 1px solid var(--line); margin: 0; }
+.ds-rule--ink { border-top-color: var(--ink); }
+
+/* Inline code */
+code, .ds-code { font-family: var(--ds-font-mono); font-size: 0.95em; background: var(--paper-grey); padding: 1px 4px; }

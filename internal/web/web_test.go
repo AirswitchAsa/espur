@@ -39,8 +39,12 @@ func TestHomePage(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status %d, body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "Status") {
-		t.Fatalf("missing Status: %s", rec.Body.String())
+	for _, want := range []string{
+		"es-phead__title", "Home", "vendors", "pool status",
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("home page missing %q in body", want)
+		}
 	}
 }
 
@@ -117,7 +121,7 @@ func TestHealthz_NoAdapters(t *testing.T) {
 
 func TestAddVendor_OAuth(t *testing.T) {
 	s, db := newTestServer(t)
-	form := "vendor_id=anthropic-oauth&model=anthropic/claude-sonnet-4-5&cred_kind=oauth"
+	form := "vendor_id=anthropic-oauth&model=anthropic/claude-sonnet-4-6&cred_kind=oauth"
 	req := httptest.NewRequest("POST", "/vendors/add", strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -302,6 +306,161 @@ func TestThreads_ListAndDetail(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("thread detail missing %q: %s", want, body)
 		}
+	}
+}
+
+func TestStaticAssetsServed(t *testing.T) {
+	s, _ := newTestServer(t)
+	for _, p := range []string{"/static/css/espur.css", "/static/js/app.js"} {
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", p, nil))
+		if rec.Code != 200 {
+			t.Fatalf("GET %s = %d", p, rec.Code)
+		}
+		if rec.Body.Len() < 100 {
+			t.Fatalf("GET %s suspiciously small: %d bytes", p, rec.Body.Len())
+		}
+	}
+}
+
+func TestSettingsPage(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/settings", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+	for _, want := range []string{"Settings", "Transcript tail", "Master key reminder"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("settings missing %q", want)
+		}
+	}
+}
+
+func TestHealthHumanPage(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.RegisterAdapter(fakeAdapter{"discord", true})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/health", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+	// JSON is HTML-escaped (&#34; for "); look for tokens that survive escaping.
+	for _, want := range []string{"All systems operational", "raw /healthz", "uptime", "adapters"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("health page missing %q in body", want)
+		}
+	}
+}
+
+func TestVendorReorderAll_PersistsOrder(t *testing.T) {
+	s, db := newTestServer(t)
+	ctx := context.Background()
+	_ = db.UpsertVendor(ctx, store.Vendor{VendorID: "a", Model: "m", Enabled: true, Position: 0})
+	_ = db.UpsertVendor(ctx, store.Vendor{VendorID: "b", Model: "m", Enabled: true, Position: 1})
+	_ = db.UpsertVendor(ctx, store.Vendor{VendorID: "c", Model: "m", Enabled: true, Position: 2})
+
+	rec := postForm(t, s, "/vendors/reorder-all", "ids=c&ids=a&ids=b")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+	vs, _ := db.ListVendors(ctx)
+	got := []string{vs[0].VendorID, vs[1].VendorID, vs[2].VendorID}
+	want := []string{"c", "a", "b"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestThreadWipeMemory(t *testing.T) {
+	s, _ := newTestServer(t)
+	platform, thread := "discord", "thread-x"
+	if err := s.ts.Append(platform, thread, transcript.Record{
+		Kind: transcript.KindUser, Author: transcript.Author{Label: "alice"}, Body: "hi",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dir := s.ts.ThreadDir(platform, thread)
+	enc := filepath.Base(dir)
+	agentsPath := filepath.Join(dir, "AGENTS.md")
+	if err := os.WriteFile(agentsPath, []byte("# memory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := postForm(t, s, "/threads/"+platform+"/"+enc+"/wipe-memory", "")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d", rec.Code)
+	}
+	body, _ := os.ReadFile(agentsPath)
+	if len(body) != 0 {
+		t.Fatalf("AGENTS.md not wiped: %q", body)
+	}
+}
+
+func TestThreadDelete_RemovesWorkdir(t *testing.T) {
+	s, _ := newTestServer(t)
+	platform, thread := "discord", "thread-del"
+	if err := s.ts.Append(platform, thread, transcript.Record{
+		Kind: transcript.KindUser, Author: transcript.Author{Label: "x"}, Body: "y",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dir := s.ts.ThreadDir(platform, thread)
+	enc := filepath.Base(dir)
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("workdir missing: %v", err)
+	}
+	rec := postForm(t, s, "/threads/"+platform+"/"+enc+"/delete", "")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("workdir still exists after delete: %v", err)
+	}
+}
+
+func TestVendorsPage_ShowsCatalogProviders(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/vendors", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+	// catalog must populate the add-vendor drawer's <optgroup>s
+	for _, want := range []string{"Anthropic", "OpenAI", "model-select", "Add vendor"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("vendors page missing %q", want)
+		}
+	}
+}
+
+func TestAddVendor_RejectsUnknownModel(t *testing.T) {
+	s, _ := newTestServer(t)
+	form := "vendor_id=x&model=mystery/foo&cred_kind=byo_key"
+	rec := postForm(t, s, "/vendors/add", form)
+	if rec.Code != 400 {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "curated catalog") {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+}
+
+func TestAddVendor_AutoFillsEnvKey(t *testing.T) {
+	s, db := newTestServer(t)
+	ctx := context.Background()
+	form := "vendor_id=anth-byo&model=anthropic/claude-haiku-4-5&cred_kind=byo_key"
+	rec := postForm(t, s, "/vendors/add", form)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("got %d body=%s", rec.Code, rec.Body.String())
+	}
+	c, err := db.GetCredential(ctx, "vendor", "anth-byo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.EnvKeys) != 1 || c.EnvKeys[0] != "ANTHROPIC_API_KEY" {
+		t.Fatalf("expected env_key auto-filled, got %+v", c.EnvKeys)
 	}
 }
 

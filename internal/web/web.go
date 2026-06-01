@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/punny/espur/internal/contextasm"
+	"github.com/punny/espur/internal/memory"
 	"github.com/punny/espur/internal/opencode"
 	"github.com/punny/espur/internal/providers"
 	"github.com/punny/espur/internal/secrets"
@@ -104,6 +105,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /threads", s.threads)
 	mux.HandleFunc("GET /threads/{platform}/{enc_id}", s.threadDetail)
 	mux.HandleFunc("POST /threads/{platform}/{enc_id}/wipe-memory", s.threadWipeMemory)
+	mux.HandleFunc("POST /threads/{platform}/{enc_id}/instructions", s.threadInstructions)
 	mux.HandleFunc("POST /threads/{platform}/{enc_id}/delete", s.threadDelete)
 	mux.HandleFunc("GET /settings", s.settings)
 	mux.HandleFunc("GET /health", s.healthPage)
@@ -355,6 +357,17 @@ func providerShort(name string) string {
 func (s *Server) vendorsList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vs, _ := s.db.ListVendors(ctx)
+	// Cross-check OAuth credentials against opencode's auth.json so the UI
+	// reports whether the operator has actually completed `opencode auth login`
+	// rather than just whether they pressed "Add" with the OAuth radio on.
+	authedProviders := map[string]bool{}
+	if entries, err := opencode.ReadAuthEntries(); err == nil {
+		for _, e := range entries {
+			if e.HasKey {
+				authedProviders[e.Provider] = true
+			}
+		}
+	}
 	now := time.Now()
 	rows := make([]vendorRow, 0, len(vs))
 	for _, v := range vs {
@@ -369,16 +382,28 @@ func (s *Server) vendorsList(w http.ResponseWriter, r *http.Request) {
 		}
 		// derive provider from model string
 		prov, _ := providers.Lookup(v.Model)
-		provName, provShort := "", ""
+		provName, provShort, provID := "", "", ""
 		if prov != nil {
 			provName = prov.Name
 			provShort = providerShort(prov.Name)
+			provID = prov.ID
 			if envKey == "" {
 				envKey = prov.EnvKey
 			}
 		} else if i := strings.IndexByte(v.Model, '/'); i > 0 {
 			provName = v.Model[:i]
 			provShort = providerShort(provName)
+			provID = v.Model[:i]
+		}
+		// For OAuth rows, the credential status comes from auth.json, not from
+		// the DB row. "linked" only when opencode has a usable entry; otherwise
+		// "pending" — the operator still needs to run `opencode auth login`.
+		if v.CredKind == "oauth" {
+			if authedProviders[provID] {
+				credStatus = "linked"
+			} else {
+				credStatus = "pending"
+			}
 		}
 
 		pen, _ := s.db.GetPenalty(ctx, v.VendorID)
@@ -460,10 +485,14 @@ func (s *Server) vendorAdd(w http.ResponseWriter, r *http.Request) {
 		})
 		setFlash(w, "info", "Vendor added", id+" needs a key before it can be used.")
 	case "oauth":
+		// "pending" — the DB row exists but opencode auth.json has no entry
+		// yet. The vendors page flips this to "linked" once auth.json shows
+		// a usable credential for the provider. See vendorsList.
 		_ = s.db.PutCredential(ctx, store.Credential{
-			Scope: "vendor", ID: id, Kind: "oauth", Status: "set",
+			Scope: "vendor", ID: id, Kind: "oauth", Status: "pending",
 		})
-		setFlash(w, "ok", "Vendor added", id+" uses OAuth — credential resolved from the provider session.")
+		setFlash(w, "info", "Vendor added",
+			"Next: run `opencode auth login --provider "+prov.ID+"` to authenticate. See the OAuth page for the exact command.")
 	}
 	http.Redirect(w, r, "/vendors", http.StatusSeeOther)
 }
@@ -698,8 +727,8 @@ type threadDetailPage struct {
 	EncID        string
 	Workdir      string
 	Turns        int
-	Agents       string
-	Facts        []factRow
+	Instructions string    // operator-editable section extracted from AGENTS.md
+	Facts        []factRow // bot-owned memory files (memory_index.md + slug files)
 	Tail         []tailItem
 	WorkdirFiles []workdirFile
 }
@@ -736,10 +765,15 @@ func (s *Server) threadDetail(w http.ResponseWriter, r *http.Request) {
 			Name: e.Name(), IsDir: false,
 			SizeFmt: humanBytes(fi.Size()), ModTimeFmt: humanTime(fi.ModTime()),
 		})
-		if strings.HasPrefix(e.Name(), "fact_") && strings.HasSuffix(e.Name(), ".md") {
-			body, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+		// Bot-owned memory files are everything *.md in the workdir EXCEPT
+		// AGENTS.md (system seed + operator instructions live there). This
+		// covers the new layout (memory_index.md + <slug>.md) and the legacy
+		// fact_<slug>.md naming in pre-existing threads.
+		name := e.Name()
+		if strings.HasSuffix(name, ".md") && name != "AGENTS.md" {
+			body, _ := os.ReadFile(filepath.Join(dir, name))
 			facts = append(facts, factRow{
-				Name: e.Name(), EscapedName: escapeForData(e.Name()),
+				Name: name, EscapedName: escapeForData(name),
 				Size: fi.Size(), SizeFmt: humanBytes(fi.Size()),
 				Body: string(body),
 			})
@@ -759,18 +793,76 @@ func (s *Server) threadDetail(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "thread_detail", threadDetailPage{
 		Platform: platform, EncID: enc,
 		Workdir: dir, Turns: len(tail),
-		Agents: string(agentsBytes), Facts: facts, Tail: tail,
+		Instructions: memory.ExtractUserInstructions(string(agentsBytes)),
+		Facts:        facts, Tail: tail,
 		WorkdirFiles: wdFiles,
 	})
 }
 
+// threadWipeMemory resets the bot's memory for this thread: removes every
+// *.md file in the workdir EXCEPT AGENTS.md. AGENTS.md is preserved because
+// it carries the system seed plus the operator's custom instructions — both
+// of which the operator wants to keep across a memory reset.
 func (s *Server) threadWipeMemory(w http.ResponseWriter, r *http.Request) {
 	platform := r.PathValue("platform")
 	enc := r.PathValue("enc_id")
 	dir := filepath.Join(s.ts.BaseDir, "threads", platform, enc)
-	// truncate (don't delete) so the file's existence stays consistent
-	_ = os.WriteFile(filepath.Join(dir, "AGENTS.md"), nil, 0o644)
-	setFlash(w, "ok", "AGENTS.md wiped", "Memory reset for this thread.")
+	// guardrail: refuse to act outside threads/
+	root := filepath.Join(s.ts.BaseDir, "threads")
+	if !strings.HasPrefix(filepath.Clean(dir), filepath.Clean(root)+string(filepath.Separator)) {
+		http.Error(w, "refuse to act outside threads root", http.StatusBadRequest)
+		return
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".md") || name == "AGENTS.md" {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+	setFlash(w, "ok", "Bot memory reset", "Index and slug files were removed. Your instructions are kept.")
+	http.Redirect(w, r, "/threads/"+platform+"/"+enc, http.StatusSeeOther)
+}
+
+// threadInstructions replaces the operator-editable user-instructions block
+// inside AGENTS.md with the posted body. The rest of AGENTS.md (the system
+// memory rules above the markers) is preserved verbatim. Opencode reads
+// AGENTS.md natively from cwd, so anything saved here becomes per-thread
+// custom instructions on the next invocation.
+func (s *Server) threadInstructions(w http.ResponseWriter, r *http.Request) {
+	platform := r.PathValue("platform")
+	enc := r.PathValue("enc_id")
+	dir := filepath.Join(s.ts.BaseDir, "threads", platform, enc)
+	// guardrail: refuse to write outside threads/
+	root := filepath.Join(s.ts.BaseDir, "threads")
+	if !strings.HasPrefix(filepath.Clean(dir), filepath.Clean(root)+string(filepath.Separator)) {
+		http.Error(w, "refuse to write outside threads root", http.StatusBadRequest)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := memory.EnsureWorkDir(dir); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	agentsPath := filepath.Join(dir, "AGENTS.md")
+	existing, err := os.ReadFile(agentsPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	updated := memory.ReplaceUserInstructions(string(existing), r.FormValue("body"))
+	if err := os.WriteFile(agentsPath, []byte(updated), 0o644); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	setFlash(w, "ok", "Instructions saved", "Picked up on the next invocation.")
 	http.Redirect(w, r, "/threads/"+platform+"/"+enc, http.StatusSeeOther)
 }
 

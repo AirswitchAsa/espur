@@ -171,8 +171,17 @@
       setCredOpt(credOauthOpt, kind === "oauth");
       if (credHint) {
         credHint.textContent = kind === "oauth"
-          ? "OAuth vendors resolve their token from the provider session — no env var is read."
+          ? "OAuth vendors resolve their token from the provider session — no env var is read. After adding, run `opencode auth login` to authenticate."
           : "The key you set is written to this variable at invocation time.";
+      }
+      // The env-var field is irrelevant to OAuth — hide just the input and its
+      // label (keep the hint visible so the operator sees the next step).
+      if (envField) {
+        envField.style.display = kind === "oauth" ? "none" : "";
+        const lbl = envField.previousElementSibling;
+        if (lbl && lbl.classList.contains("es-label")) {
+          lbl.style.display = kind === "oauth" ? "none" : "";
+        }
       }
     }
     document.querySelectorAll("[data-cred-opt]").forEach(function (opt) {

@@ -150,6 +150,7 @@ button { font-family: inherit; }
    Inline panel (set-key) — DS inline-panel, no side borders
    ----------------------------------------------------------------------------- */
 .es-inline { background: var(--paper-grey); border-top: 1px solid var(--line-strong); border-bottom: 1px solid var(--line-strong); padding: 16px 16px 16px 48px; display: flex; flex-direction: column; gap: 12px; animation: es-slidedown var(--ds-motion-base) var(--ds-ease-standard); }
+.es-inline[hidden] { display: none; }
 @keyframes es-slidedown { from { opacity: 0; } to { opacity: 1; } }
 .es-inline__label { font-family: var(--ds-font-mono); font-size: var(--ds-text-2xs); letter-spacing: var(--ds-tracking-wider); text-transform: uppercase; color: var(--ink-soft); }
 .es-inline__row { display: flex; align-items: flex-end; gap: 12px; }
@@ -174,6 +175,9 @@ button { font-family: inherit; }
 .es-text::placeholder { color: var(--muted); }
 .es-text:read-only { color: var(--muted); border-bottom-style: dashed; cursor: default; }
 .es-text--mono { font-family: var(--ds-font-mono); font-size: var(--ds-text-sm); }
+.es-text--area { width: 100%; box-sizing: border-box; font-family: var(--ds-font-mono); font-size: var(--ds-text-sm); line-height: 1.6; background: var(--paper); color: var(--ink); border: 0; border-top: 1px solid var(--line); outline: 0; padding: 14px 16px; min-height: 280px; resize: vertical; transition: background var(--ds-motion-base); }
+.es-text--area:focus { background: var(--paper-soft); }
+.es-text--area::placeholder { color: var(--muted); }
 .es-select { width: 100%; font: inherit; font-size: var(--ds-text-base); background: var(--paper); border: 1px solid var(--line-strong); color: var(--ink); padding: 10px 12px; outline: 0; border-radius: 0; cursor: pointer; appearance: none; background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23727171' stroke-width='2'><path d='M6 9l6 6 6-6'/></svg>"); background-repeat: no-repeat; background-position: right 12px center; }
 .es-select:focus { border-color: var(--ink); }
 

@@ -225,3 +225,41 @@ func TestExtractSessionID_None(t *testing.T) {
 		t.Fatalf("expected error, got id=%q", id)
 	}
 }
+
+func TestBuildEnv_PassthroughForwardsListedVars(t *testing.T) {
+	t.Setenv("ESPUR_OPENCODE_ENV_PASSTHROUGH", "EXA_API_KEY, XAI_API_KEY ,UNSET_VAR")
+	t.Setenv("EXA_API_KEY", "exa-secret")
+	t.Setenv("XAI_API_KEY", "xai-secret")
+	// UNSET_VAR is deliberately not set — passthrough should silently skip it.
+	os.Unsetenv("UNSET_VAR")
+
+	env := buildEnv(map[string]string{"ANTHROPIC_API_KEY": "anth-secret"})
+
+	got := map[string]string{}
+	for _, kv := range env {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			got[kv[:i]] = kv[i+1:]
+		}
+	}
+	if got["EXA_API_KEY"] != "exa-secret" || got["XAI_API_KEY"] != "xai-secret" {
+		t.Fatalf("passthrough missing: env=%v", got)
+	}
+	if _, ok := got["UNSET_VAR"]; ok {
+		t.Fatalf("UNSET_VAR should be skipped when not set")
+	}
+	if got["ANTHROPIC_API_KEY"] != "anth-secret" {
+		t.Fatalf("vendor cred not forwarded: %v", got)
+	}
+}
+
+func TestBuildEnv_PassthroughEmpty(t *testing.T) {
+	t.Setenv("ESPUR_OPENCODE_ENV_PASSTHROUGH", "")
+	t.Setenv("EXA_API_KEY", "should-not-leak")
+
+	env := buildEnv(map[string]string{})
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "EXA_API_KEY=") {
+			t.Fatalf("EXA_API_KEY leaked through empty passthrough: %s", kv)
+		}
+	}
+}

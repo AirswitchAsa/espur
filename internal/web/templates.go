@@ -231,8 +231,10 @@ const vendorsTpl = `{{ define "vendors" }}
       <span><span class="es-prov" title="{{ $r.ProviderName }}">{{ $r.ProviderShort }}</span></span>
       <span><span class="ds-tag ds-tag--block">{{ if eq $r.Vendor.CredKind "oauth" }}OAuth{{ else }}BYO{{ end }}</span></span>
       <span>
-        {{ if eq $r.Vendor.CredKind "oauth" }}
+        {{ if eq $r.CredStatus "linked" }}
         <span class="es-status es-status--ok"><span class="es-status__dot"></span>linked</span>
+        {{ else if eq $r.CredStatus "pending" }}
+        <span class="es-status es-status--warn" title="run: opencode auth login --provider {{ $r.ProviderName }}"><span class="es-status__dot"></span>auth pending</span>
         {{ else if eq $r.CredStatus "set" }}
         <span class="es-status es-status--ok"><span class="es-status__dot"></span>set</span>
         {{ else }}
@@ -274,18 +276,18 @@ const vendorsTpl = `{{ define "vendors" }}
     </div>
     {{ if eq $r.Vendor.CredKind "byo_key" }}
     <div class="es-inline" id="setkey-{{ $r.Vendor.VendorID }}" hidden>
-      <div class="es-inline__label">set key · {{ $r.Vendor.VendorID }}</div>
+      <div class="es-inline__label">{{ if eq $r.CredStatus "set" }}replace key{{ else }}set key{{ end }} · {{ $r.Vendor.VendorID }}</div>
       <form method="post" action="/vendors/{{ $r.Vendor.VendorID }}/key" class="es-inline__row">
         <input type="hidden" name="env_key" value="{{ $r.EnvKey }}">
         <div class="es-secret">
           {{ template "icon-key-sm" }}
-          <input type="password" name="key" id="key-input-{{ $r.Vendor.VendorID }}" placeholder="{{ if $r.EnvKey }}{{ $r.EnvKey }} value{{ else }}secret value{{ end }}" required>
+          <input type="password" name="key" id="key-input-{{ $r.Vendor.VendorID }}" placeholder="{{ if $r.EnvKey }}{{ if eq $r.CredStatus "set" }}new {{ end }}{{ $r.EnvKey }} value{{ else }}secret value{{ end }}" required>
           <button type="button" class="es-secret__btn" data-secret-toggle="key-input-{{ $r.Vendor.VendorID }}" aria-label="toggle visibility">{{ template "icon-eye" }}</button>
         </div>
-        <button type="submit" class="ds-btn ds-btn--ink ds-btn--sm"><span class="ds-btn__label">Save key</span></button>
+        <button type="submit" class="ds-btn ds-btn--ink ds-btn--sm"><span class="ds-btn__label">{{ if eq $r.CredStatus "set" }}Replace{{ else }}Save{{ end }} key</span></button>
         <button type="button" class="ds-btn ds-btn--ghost ds-btn--sm" data-setkey-toggle="{{ $r.Vendor.VendorID }}"><span class="ds-btn__label">Cancel</span></button>
       </form>
-      <div class="es-hint">Stored encrypted at rest, written to <code>{{ $r.EnvKey }}</code> at invocation time. Never displayed again after saving.</div>
+      <div class="es-hint">{{ if eq $r.CredStatus "set" }}Replaces the stored credential.{{ else }}Stored encrypted at rest.{{ end }} Written to <code>{{ $r.EnvKey }}</code> at invocation time. Never displayed again after saving.</div>
     </div>
     {{ end }}
 
@@ -492,41 +494,50 @@ const threadDetailTpl = `{{ define "thread_detail" }}
   </div>
 
   <div style="padding-top: 18px" data-tab-pane="memory" data-pane-group="thread" hidden>
-    {{ if or .Agents .Facts }}
-    <div class="es-tree-pane" data-picker="mem">
-      <div class="es-tree-side es-scroll">
-        <div class="es-spec" style="padding: 4px 8px 10px">memory files</div>
-        <ul class="ds-tree">
-          <li>
-            <button type="button" class="ds-tree__row" aria-current="true" data-file-pick="AGENTS.md">
-              <span class="ds-tree__indicator" data-kind="leaf"></span>
-              <span class="ds-tree__label">AGENTS.md</span>
-            </button>
-          </li>
-          {{ range .Facts }}
-          <li>
-            <button type="button" class="ds-tree__row" data-file-pick="{{ .Name }}">
-              <span class="ds-tree__indicator" data-kind="leaf"></span>
-              <span class="ds-tree__label">{{ .Name }}</span>
-              <span class="ds-tree__meta">{{ .SizeFmt }}</span>
-            </button>
-          </li>
+    <form method="post" action="/threads/{{ .Platform }}/{{ .EncID }}/instructions" class="es-card" style="margin: 0">
+      <div class="es-card__head">
+        <div>
+          <div class="es-card__title">Custom instructions</div>
+          <div class="es-hint">Persona, tone, do/don't rules for this thread. The bot reads these alongside its built-in memory rules on every invocation. Empty is fine.</div>
+        </div>
+        <button type="submit" class="ds-btn ds-btn--ink ds-btn--sm">{{ template "icon-check-lg" }}<span class="ds-btn__label">Save</span></button>
+      </div>
+      <div class="es-card__body" style="padding: 0">
+        <textarea name="body" class="es-text--area" spellcheck="false" placeholder="# House rules for this thread&#10;&#10;- Speak in the persona of …&#10;- Never use emoji&#10;- When asked about X, defer to …">{{ .Instructions }}</textarea>
+      </div>
+    </form>
+
+    {{ if .Facts }}
+    <div class="es-card" style="margin-top: 16px; padding: 0">
+      <div class="es-card__head">
+        <div>
+          <div class="es-card__title">Bot memory</div>
+          <div class="es-hint">What the bot has stored about this thread on its own — the index and slug files it manages. Read-only here.</div>
+        </div>
+      </div>
+      <div class="es-tree-pane" data-picker="mem" style="border: 0">
+        <div class="es-tree-side es-scroll">
+          <ul class="ds-tree">
+            {{ range $i, $f := .Facts }}
+            <li>
+              <button type="button" class="ds-tree__row" {{ if eq $i 0 }}aria-current="true"{{ end }} data-file-pick="{{ $f.Name }}">
+                <span class="ds-tree__indicator" data-kind="leaf"></span>
+                <span class="ds-tree__label">{{ $f.Name }}</span>
+                <span class="ds-tree__meta">{{ $f.SizeFmt }}</span>
+              </button>
+            </li>
+            {{ end }}
+          </ul>
+        </div>
+        <div class="es-tree-view es-scroll" data-file-view="mem">
+          {{ with index .Facts 0 }}
+          <pre style="font-family: var(--ds-font-mono); white-space: pre-wrap; word-break: break-word; color: var(--ink); font-size: 13px; line-height: 1.6; margin: 0">{{ .Body }}</pre>
           {{ end }}
-        </ul>
+        </div>
+        {{ range .Facts }}
+        <template data-file-body="mem-{{ .EscapedName }}"><pre style="font-family: var(--ds-font-mono); white-space: pre-wrap; word-break: break-word; color: var(--ink); font-size: 13px; line-height: 1.6; margin: 0">{{ .Body }}</pre></template>
+        {{ end }}
       </div>
-      <div class="es-tree-view es-scroll" data-file-view="mem">
-        <pre style="font-family: var(--ds-font-mono); white-space: pre-wrap; word-break: break-word; color: var(--ink); font-size: 13px; line-height: 1.6; margin: 0">{{ .Agents }}</pre>
-      </div>
-      {{ range .Facts }}
-      <template data-file-body="mem-{{ .EscapedName }}"><pre style="font-family: var(--ds-font-mono); white-space: pre-wrap; word-break: break-word; color: var(--ink); font-size: 13px; line-height: 1.6; margin: 0">{{ .Body }}</pre></template>
-      {{ end }}
-      <template data-file-body="mem-AGENTS_46md"><pre style="font-family: var(--ds-font-mono); white-space: pre-wrap; word-break: break-word; color: var(--ink); font-size: 13px; line-height: 1.6; margin: 0">{{ .Agents }}</pre></template>
-    </div>
-    {{ else }}
-    <div class="es-empty">
-      <div class="es-empty__glyph">{{ template "icon-file" }}</div>
-      <div class="es-empty__title">No memory files</div>
-      <div class="es-empty__sub">AGENTS.md and fact files appear here once the bot writes them.</div>
     </div>
     {{ end }}
   </div>
@@ -559,10 +570,10 @@ const threadDetailTpl = `{{ define "thread_detail" }}
     <div class="es-danger__head">danger zone</div>
     <div class="es-danger__row">
       <div class="es-danger__txt">
-        <span class="es-danger__name">Wipe AGENTS.md</span>
-        <span class="es-danger__desc">Reset this thread's memory. Transcript and workdir files are kept.</span>
+        <span class="es-danger__name">Reset bot memory</span>
+        <span class="es-danger__desc">Empties <code>AGENTS.md</code> — the file the bot uses to remember facts about this thread. Your <code>NOTES.md</code>, transcript, and workdir files are kept.</span>
       </div>
-      <button class="ds-btn ds-btn--danger ds-btn--sm" data-open="confirm-wipe">{{ template "icon-trash" }}<span class="ds-btn__label">Wipe memory</span></button>
+      <button class="ds-btn ds-btn--danger ds-btn--sm" data-open="confirm-wipe">{{ template "icon-trash" }}<span class="ds-btn__label">Reset memory</span></button>
     </div>
     <div class="es-danger__row">
       <div class="es-danger__txt">
@@ -576,15 +587,15 @@ const threadDetailTpl = `{{ define "thread_detail" }}
   <div class="es-overlay" id="confirm-wipe" hidden>
     <div class="es-scrim" data-close="confirm-wipe"></div>
     <div class="es-modal" role="dialog" aria-modal="true">
-      <div class="es-modal__head">{{ template "icon-alert" }}<span class="es-modal__title">Wipe AGENTS.md</span></div>
+      <div class="es-modal__head">{{ template "icon-alert" }}<span class="es-modal__title">Reset bot memory</span></div>
       <div class="es-modal__body">
-        This resets <strong>AGENTS.md</strong> for this thread to empty. The bot loses all learned house rules for this thread.
+        This empties <strong>AGENTS.md</strong>, the bot's own memory file for this thread. Your <code>NOTES.md</code> stays put.
         <div class="es-modal__detail">{{ .Workdir }}/AGENTS.md</div>
       </div>
       <div class="es-modal__foot">
         <button type="button" class="ds-btn ds-btn--ghost" data-close="confirm-wipe"><span class="ds-btn__label">Cancel</span></button>
         <form method="post" action="/threads/{{ .Platform }}/{{ .EncID }}/wipe-memory" style="margin: 0">
-          <button type="submit" class="ds-btn ds-btn--danger-filled">{{ template "icon-trash" }}<span class="ds-btn__label">Wipe memory</span></button>
+          <button type="submit" class="ds-btn ds-btn--danger-filled">{{ template "icon-trash" }}<span class="ds-btn__label">Reset memory</span></button>
         </form>
       </div>
     </div>

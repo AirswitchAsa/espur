@@ -4,12 +4,14 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/punny/espur/internal/memory"
 	"github.com/punny/espur/internal/secrets"
 	"github.com/punny/espur/internal/store"
 	"github.com/punny/espur/internal/transcript"
@@ -141,8 +143,154 @@ func TestAddVendor_OAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected cred row for oauth vendor: %v", err)
 	}
-	if c.Kind != "oauth" || c.Status != "set" || len(c.Blob) != 0 || len(c.EnvKeys) != 0 {
+	// OAuth row must land in `pending` — the operator still needs to run
+	// `opencode auth login` for the vendor to become invocable.
+	if c.Kind != "oauth" || c.Status != "pending" || len(c.Blob) != 0 || len(c.EnvKeys) != 0 {
 		t.Fatalf("unexpected cred shape: %+v", c)
+	}
+}
+
+// withAuthJSON writes a minimal opencode auth.json into a temp dir and
+// repoints XDG_DATA_HOME at it for the duration of the test. Returns nothing
+// — t.Setenv handles cleanup.
+func withAuthJSON(t *testing.T, payload string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "opencode"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if payload != "" {
+		if err := os.WriteFile(filepath.Join(dir, "opencode", "auth.json"), []byte(payload), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("XDG_DATA_HOME", dir)
+}
+
+func TestVendorsList_OAuthPendingUntilAuthJSON(t *testing.T) {
+	withAuthJSON(t, "") // no auth.json at all
+	s, _ := newTestServer(t)
+	postForm(t, s, "/vendors/add", "vendor_id=anth-oauth&model=anthropic/claude-sonnet-4-6&cred_kind=oauth")
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/vendors", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "auth pending") {
+		t.Fatalf("expected `auth pending` for OAuth row with no auth.json:\n%s", excerptVendorRow(body, "anth-oauth"))
+	}
+	// Must NOT show "linked" until auth.json has the provider.
+	if strings.Contains(excerptVendorRow(body, "anth-oauth"), ">linked<") {
+		t.Fatalf("OAuth row should not be `linked` without auth.json:\n%s", excerptVendorRow(body, "anth-oauth"))
+	}
+}
+
+func TestVendorsList_OAuthLinkedWhenAuthJSONHasProvider(t *testing.T) {
+	// auth.json with a usable anthropic entry → row should report linked.
+	withAuthJSON(t, `{"anthropic":{"type":"oauth","access":"token-xyz"}}`)
+	s, _ := newTestServer(t)
+	postForm(t, s, "/vendors/add", "vendor_id=anth-oauth&model=anthropic/claude-sonnet-4-6&cred_kind=oauth")
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/vendors", nil))
+	row := excerptVendorRow(rec.Body.String(), "anth-oauth")
+	if !strings.Contains(row, ">linked<") {
+		t.Fatalf("expected `linked` for OAuth row with auth.json:\n%s", row)
+	}
+	if strings.Contains(row, "auth pending") {
+		t.Fatalf("row should not be `auth pending` once auth.json has the provider:\n%s", row)
+	}
+}
+
+func TestVendorsList_OAuthRemainsPendingWhenAuthJSONLacksKey(t *testing.T) {
+	// auth.json with the provider listed but no usable key/access/refresh.
+	// HasKey is false, so the row must stay pending.
+	withAuthJSON(t, `{"anthropic":{"type":"oauth"}}`)
+	s, _ := newTestServer(t)
+	postForm(t, s, "/vendors/add", "vendor_id=anth-oauth&model=anthropic/claude-sonnet-4-6&cred_kind=oauth")
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/vendors", nil))
+	row := excerptVendorRow(rec.Body.String(), "anth-oauth")
+	if !strings.Contains(row, "auth pending") {
+		t.Fatalf("expected `auth pending` when auth.json entry has no key:\n%s", row)
+	}
+}
+
+// excerptVendorRow slices the markup from the row's opening through to the
+// start of the next vendor row (or EOF). The row's full footprint includes
+// the row div, the inline set-key panel, and the delete overlay — all
+// rendered sequentially per vendor — so we grab the whole window. Failure
+// messages get a few KB but stay scoped to one vendor.
+func excerptVendorRow(body, vid string) string {
+	marker := `data-vid="` + vid + `"`
+	i := strings.Index(body, marker)
+	if i < 0 {
+		return "<no row for " + vid + ">"
+	}
+	// Find the next data-vid="..." after this row, if any.
+	rest := body[i+len(marker):]
+	next := strings.Index(rest, `data-vid="`)
+	if next < 0 {
+		return body[i:]
+	}
+	return body[i : i+len(marker)+next]
+}
+
+func TestEsInline_HasHiddenOverrideInCSS(t *testing.T) {
+	// .es-inline carries `display: flex`, which overrides the UA stylesheet's
+	// implicit `display: none` for the HTML `hidden` attribute. Without an
+	// explicit `.es-inline[hidden] { display: none }` rule the inline set-key
+	// panel renders as always visible. Regression: the operator was seeing
+	// the set/replace key panel permanently open under every BYO row.
+	rec := httptest.NewRecorder()
+	s, _ := newTestServer(t)
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/static/css/espur.css", nil))
+	if rec.Code != 200 {
+		t.Fatalf("espur.css fetch status %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), ".es-inline[hidden]") {
+		t.Fatal("espur.css missing `.es-inline[hidden] { display: none }` rule — the hidden attr won't actually hide the panel")
+	}
+}
+
+func TestVendorsList_BYOLabelsMatchCredState(t *testing.T) {
+	s, _ := newTestServer(t)
+	// Add a BYO vendor; no key set yet.
+	postForm(t, s, "/vendors/add", "vendor_id=ds&model=deepseek/deepseek-chat&cred_kind=byo_key")
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/vendors", nil))
+	row := excerptVendorRow(rec.Body.String(), "ds")
+	// Before key is set: kebab + inline panel + button all say "Set key" /
+	// "set key" / "Save key" — and definitely not the replace variants.
+	for _, want := range []string{">Set key<", "set key · ds", ">Save key<"} {
+		if !strings.Contains(row, want) {
+			t.Fatalf("pre-set row missing %q:\n%s", want, row)
+		}
+	}
+	for _, bad := range []string{">Replace key<", "replace key · ds", ">Replace key<"} {
+		if strings.Contains(row, bad) {
+			t.Fatalf("pre-set row should not contain %q:\n%s", bad, row)
+		}
+	}
+
+	// Set a key.
+	postForm(t, s, "/vendors/ds/key", "key=sk-test&env_key=DEEPSEEK_API_KEY")
+
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/vendors", nil))
+	row = excerptVendorRow(rec.Body.String(), "ds")
+	// After key set: all three labels flip to the replace variants.
+	for _, want := range []string{">Replace key<", "replace key · ds", ">Replace key<"} {
+		if !strings.Contains(row, want) {
+			t.Fatalf("post-set row missing %q:\n%s", want, row)
+		}
+	}
+	if strings.Contains(row, ">Set key<") {
+		t.Fatalf("post-set row should not still show 'Set key':\n%s", row)
+	}
+	if strings.Contains(row, ">Save key<") {
+		t.Fatalf("post-set row should not still show 'Save key':\n%s", row)
 	}
 }
 
@@ -169,6 +317,8 @@ func TestAddVendor_RejectsUnknownCredKind(t *testing.T) {
 		t.Fatalf("expected 400, got %d", rec.Code)
 	}
 }
+
+func urlEncode(s string) string { return url.QueryEscape(s) }
 
 func postForm(t *testing.T, s *Server, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -279,10 +429,16 @@ func TestThreads_ListAndDetail(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := s.ts.ThreadDir(platform, thread)
-	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("# memory index"), 0o644); err != nil {
+	// AGENTS.md is no longer rendered verbatim in the UI — only its
+	// user-instructions section is. We still write one to exercise the
+	// scan that excludes AGENTS.md from the bot-memory tree.
+	if err := memory.EnsureWorkDir(dir); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "fact_foo.md"), []byte("detail"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "memory_index.md"), []byte("- [foo](foo.md) — gloss"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "foo.md"), []byte("detail body"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -302,10 +458,14 @@ func TestThreads_ListAndDetail(t *testing.T) {
 		t.Fatalf("thread detail status %d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"memory index", "fact_foo.md", "hello world"} {
+	for _, want := range []string{"memory_index.md", "foo.md", "detail body", "hello world", "Bot memory"} {
 		if !strings.Contains(body, want) {
-			t.Fatalf("thread detail missing %q: %s", want, body)
+			t.Fatalf("thread detail missing %q", want)
 		}
+	}
+	// AGENTS.md must NOT appear in the bot-memory tree (it's not "memory").
+	if strings.Contains(body, "data-file-pick=\"AGENTS.md\"") {
+		t.Fatalf("AGENTS.md leaked into bot-memory tree")
 	}
 }
 
@@ -374,9 +534,9 @@ func TestVendorReorderAll_PersistsOrder(t *testing.T) {
 	}
 }
 
-func TestThreadWipeMemory(t *testing.T) {
+func TestThreadInstructions_SavesIntoUserSection(t *testing.T) {
 	s, _ := newTestServer(t)
-	platform, thread := "discord", "thread-x"
+	platform, thread := "discord", "thread-instructions"
 	if err := s.ts.Append(platform, thread, transcript.Record{
 		Kind: transcript.KindUser, Author: transcript.Author{Label: "alice"}, Body: "hi",
 	}); err != nil {
@@ -384,17 +544,131 @@ func TestThreadWipeMemory(t *testing.T) {
 	}
 	dir := s.ts.ThreadDir(platform, thread)
 	enc := filepath.Base(dir)
-	agentsPath := filepath.Join(dir, "AGENTS.md")
-	if err := os.WriteFile(agentsPath, []byte("# memory"), 0o644); err != nil {
+	// EnsureWorkDir seeds AGENTS.md with system content + empty markers.
+	if err := memory.EnsureWorkDir(dir); err != nil {
 		t.Fatal(err)
 	}
+
+	const note = "# House rules\n\n- Persona: cat librarian"
+	rec := postForm(t, s, "/threads/"+platform+"/"+enc+"/instructions", "body="+urlEncode(note))
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d, body=%s", rec.Code, rec.Body.String())
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotStr := string(got)
+	// System content above the markers must be preserved.
+	if !strings.Contains(gotStr, "# How to use your memory") {
+		t.Fatalf("system seed section lost:\n%s", gotStr)
+	}
+	// User content must live between the markers.
+	extracted := memory.ExtractUserInstructions(gotStr)
+	if extracted != note {
+		t.Fatalf("user section mismatch:\n got=%q\nwant=%q", extracted, note)
+	}
+	// The legacy NOTES.md path must not be created.
+	if _, err := os.Stat(filepath.Join(dir, "NOTES.md")); !os.IsNotExist(err) {
+		t.Fatalf("NOTES.md should not exist, got err=%v", err)
+	}
+
+	// Detail page round-trips the user content into the textarea and exposes
+	// the save endpoint — but not the system seed.
+	detail := httptest.NewRecorder()
+	s.Handler().ServeHTTP(detail, httptest.NewRequest("GET", "/threads/"+platform+"/"+enc, nil))
+	if detail.Code != 200 {
+		t.Fatalf("detail status %d", detail.Code)
+	}
+	body := detail.Body.String()
+	for _, want := range []string{"/instructions", "es-text--area", "Persona: cat librarian", "Custom instructions"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("detail body missing %q", want)
+		}
+	}
+	// Textarea must contain user content only — not the system seed.
+	ta := body[strings.Index(body, `name="body"`):]
+	ta = ta[:strings.Index(ta, "</textarea>")]
+	if strings.Contains(ta, "How to use your memory") {
+		t.Fatalf("textarea must NOT contain system seed:\n%s", ta)
+	}
+}
+
+func TestThreadInstructions_LegacyAGENTSGetsDelimitersAppended(t *testing.T) {
+	s, _ := newTestServer(t)
+	platform, thread := "discord", "thread-legacy"
+	if err := s.ts.Append(platform, thread, transcript.Record{
+		Kind: transcript.KindUser, Author: transcript.Author{Label: "x"}, Body: "y",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dir := s.ts.ThreadDir(platform, thread)
+	enc := filepath.Base(dir)
+	// Pre-delimiter file (old thread shape): plain markdown, no markers.
+	legacy := "# Long-term memory for this thread\n\n- old fact\n"
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := postForm(t, s, "/threads/"+platform+"/"+enc+"/instructions", "body="+urlEncode("be terse"))
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d", rec.Code)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	gotStr := string(got)
+	// Legacy content preserved verbatim above the new block.
+	if !strings.HasPrefix(gotStr, legacy) {
+		t.Fatalf("legacy content not preserved as prefix:\n%s", gotStr)
+	}
+	if !strings.Contains(gotStr, memory.UserInstructionsStart) || !strings.Contains(gotStr, memory.UserInstructionsEnd) {
+		t.Fatalf("markers not inserted:\n%s", gotStr)
+	}
+	if memory.ExtractUserInstructions(gotStr) != "be terse" {
+		t.Fatalf("user section mismatch: %q", memory.ExtractUserInstructions(gotStr))
+	}
+}
+
+func TestThreadWipeMemory_KeepsAGENTSDropsSlugs(t *testing.T) {
+	s, _ := newTestServer(t)
+	platform, thread := "discord", "thread-wipe"
+	if err := s.ts.Append(platform, thread, transcript.Record{
+		Kind: transcript.KindUser, Author: transcript.Author{Label: "x"}, Body: "y",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dir := s.ts.ThreadDir(platform, thread)
+	enc := filepath.Base(dir)
+	if err := memory.EnsureWorkDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	// Plant operator instructions, a new-style slug file, a legacy fact_, and an index.
+	saveInst := postForm(t, s, "/threads/"+platform+"/"+enc+"/instructions", "body="+urlEncode("keep me"))
+	if saveInst.Code != http.StatusSeeOther {
+		t.Fatalf("save instructions status %d", saveInst.Code)
+	}
+	for _, f := range []string{"memory_index.md", "alice.md", "fact_legacy.md"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	rec := postForm(t, s, "/threads/"+platform+"/"+enc+"/wipe-memory", "")
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("status %d", rec.Code)
 	}
-	body, _ := os.ReadFile(agentsPath)
-	if len(body) != 0 {
-		t.Fatalf("AGENTS.md not wiped: %q", body)
+	// AGENTS.md must survive with operator instructions intact.
+	got, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("AGENTS.md missing after wipe: %v", err)
+	}
+	if memory.ExtractUserInstructions(string(got)) != "keep me" {
+		t.Fatalf("operator instructions lost after wipe")
+	}
+	// memory_index.md, slug, and legacy fact_ files are all gone.
+	for _, f := range []string{"memory_index.md", "alice.md", "fact_legacy.md"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); !os.IsNotExist(err) {
+			t.Fatalf("%s should have been removed, err=%v", f, err)
+		}
 	}
 }
 

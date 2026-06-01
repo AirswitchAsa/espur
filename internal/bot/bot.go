@@ -6,6 +6,8 @@ package bot
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -227,7 +229,14 @@ func (c *Core) HandleTrigger(ctx context.Context, m *adapter.MessageEvent) {
 		tail = tail[len(tail)-c.cfg.TranscriptTailN:]
 	}
 
-	userMsg := contextasm.Assemble(tail, contextasm.Trigger{
+	// AGENTS.md is part of the stable per-thread prefix; missing/unreadable
+	// is non-fatal — we just skip the memory block.
+	agentsMD, _ := os.ReadFile(filepath.Join(workDir, "AGENTS.md"))
+	userMsg := contextasm.Assemble(contextasm.Prefix{
+		Platform: m.Platform,
+		ThreadID: m.ThreadID,
+		AgentsMD: string(agentsMD),
+	}, tail, contextasm.Trigger{
 		AuthorLabel: m.Author.Label,
 		Body:        m.Body,
 	})

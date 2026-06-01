@@ -12,7 +12,7 @@ func TestAssemble_HappyPath(t *testing.T) {
 		{Kind: transcript.KindUser, Author: transcript.Author{Label: "alice"}, Body: "previous message"},
 		{Kind: transcript.KindUser, Author: transcript.Author{Label: "bob"}, Body: "a third party also chimed in"},
 	}
-	got := Assemble(tail, Trigger{AuthorLabel: "alice", Body: "the current incoming message"})
+	got := Assemble(Prefix{Platform: "discord", ThreadID: "t1"}, tail, Trigger{AuthorLabel: "alice", Body: "the current incoming message"})
 
 	for _, want := range []string{
 		`<thread-context note="recent user messages on this thread, oldest first">`,
@@ -30,7 +30,7 @@ func TestAssemble_HappyPath(t *testing.T) {
 }
 
 func TestAssemble_AttrEscape(t *testing.T) {
-	got := Assemble(nil, Trigger{AuthorLabel: `alice "quote"`, Body: "hi"})
+	got := Assemble(Prefix{}, nil, Trigger{AuthorLabel: `alice "quote"`, Body: "hi"})
 	if strings.Contains(got, `"quote"`) {
 		t.Fatalf("attribute not escaped: %s", got)
 	}
@@ -50,7 +50,7 @@ func TestAssemble_ByteCapTrimsOldestLines(t *testing.T) {
 			Body:   "line-" + repeat(byte('a'+i%26), 190) + "-end" + idxStr(i),
 		})
 	}
-	got := Assemble(tail, Trigger{AuthorLabel: "alice", Body: "now"})
+	got := Assemble(Prefix{Platform: "discord", ThreadID: "t1"}, tail, Trigger{AuthorLabel: "alice", Body: "now"})
 
 	// Locate the thread-context block and assert size cap.
 	start := strings.Index(got, `<thread-context`)
@@ -69,6 +69,31 @@ func TestAssemble_ByteCapTrimsOldestLines(t *testing.T) {
 	// The first line MUST be gone (oldest dropped).
 	if strings.Contains(got, "-end0\n") {
 		t.Fatal("oldest line should have been trimmed")
+	}
+}
+
+func TestAssemble_StablePrefixOrdering(t *testing.T) {
+	got := Assemble(
+		Prefix{Platform: "discord", ThreadID: "abc", AgentsMD: "# memory\n- foo"},
+		[]transcript.Record{{Kind: transcript.KindUser, Author: transcript.Author{Label: "alice"}, Body: "hi"}},
+		Trigger{AuthorLabel: "alice", Body: "now"},
+	)
+	thread := strings.Index(got, `<thread platform=`)
+	memory := strings.Index(got, `<memory`)
+	ctx := strings.Index(got, `<thread-context`)
+	req := strings.Index(got, `<request`)
+	if !(thread == 0 && thread < memory && memory < ctx && ctx < req) {
+		t.Fatalf("unexpected ordering thread=%d memory=%d ctx=%d req=%d\n%s", thread, memory, ctx, req, got)
+	}
+	if !strings.Contains(got, "# memory\n- foo") {
+		t.Fatalf("AGENTS.md body not inlined: %s", got)
+	}
+}
+
+func TestAssemble_NoMemoryBlockWhenEmpty(t *testing.T) {
+	got := Assemble(Prefix{Platform: "discord", ThreadID: "abc"}, nil, Trigger{Body: "hi"})
+	if strings.Contains(got, "<memory") {
+		t.Fatalf("memory block emitted without AGENTS.md: %s", got)
 	}
 }
 

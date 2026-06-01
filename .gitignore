@@ -9,6 +9,7 @@ data/
 .env
 .env.*
 .master-key
+Dockerfile.local
 
 # build artifacts
 bin/

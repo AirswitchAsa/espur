@@ -25,6 +25,11 @@ const DefaultTimeout = 120 * time.Second
 // Spec: opencode-invoke.dog.md "Notes" — grace period pinned to 5 seconds.
 const DefaultKillGrace = 5 * time.Second
 
+// DefaultExportTimeout caps `opencode export` independently of the run
+// timeout. Export is a local DB read — sub-second in practice — so a tight
+// budget is fine and prevents long-tail run completions from starving export.
+const DefaultExportTimeout = 30 * time.Second
+
 // Outcome enumerates the terminal categories defined in
 // docs/specs/opencode-invoke.dog.md ("Outcome"). Vendor-fallthrough categories
 // (rate-limit / quota / auth) are not yet classified — single-vendor slice.
@@ -180,7 +185,14 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 	// opencode 1.15.11, intermittently drops the trailing `type=text` event
 	// (the session record has the text — stdout doesn't). The session export
 	// is authoritative, so we pull assistant text from there.
-	text, exportErr := exportAssistantText(runCtx, bin, sessionID, req.Vendor.CredEnv)
+	//
+	// Use a fresh context derived from the caller's, not runCtx: if
+	// `opencode run` finished right at the deadline, runCtx may already be
+	// canceled, and exec.CommandContext would kill `opencode export` before it
+	// prints anything (manifests as "parse: unexpected end of JSON input").
+	exportCtx, exportCancel := context.WithTimeout(ctx, DefaultExportTimeout)
+	defer exportCancel()
+	text, exportErr := exportAssistantText(exportCtx, bin, sessionID, req.Vendor.CredEnv)
 	if exportErr != nil {
 		res.Outcome = OutcomeCrash
 		res.CrashReason = "export_failed"
@@ -206,6 +218,18 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 func buildEnv(creds map[string]string) []string {
 	out := make([]string, 0, 6+len(creds))
 	for _, k := range []string{"PATH", "HOME", "TMPDIR", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"} {
+		if v, ok := os.LookupEnv(k); ok {
+			out = append(out, k+"="+v)
+		}
+	}
+	// Operator-supplied passthrough: comma-separated env var names to forward
+	// to opencode children. Lets a deployment hand the child non-vendor secrets
+	// (e.g. keys consumed by user-installed skills) without code changes.
+	for _, k := range strings.Split(os.Getenv("ESPUR_OPENCODE_ENV_PASSTHROUGH"), ",") {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
 		if v, ok := os.LookupEnv(k); ok {
 			out = append(out, k+"="+v)
 		}

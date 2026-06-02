@@ -782,7 +782,7 @@ const settingsTpl = `{{ define "settings" }}
       </div>
     </div>
   </div>
-  {{ if .AnyQR }}<script>setTimeout(function(){location.reload();},2500);</script>{{ end }}
+  {{ if .AnyPending }}<script>setTimeout(function(){location.reload();},2500);</script>{{ end }}
 </div>
 {{ end }}`
 

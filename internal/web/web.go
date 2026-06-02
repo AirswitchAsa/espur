@@ -1040,7 +1040,7 @@ type settingsPage struct {
 	AdminBind      string
 	Adapters       []settingsAdapter
 	Connections    []ConnInfo
-	AnyQR          bool // a connection is awaiting a login QR scan → auto-refresh
+	AnyPending     bool // a connection is starting or awaiting a QR scan → auto-refresh
 }
 
 func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
@@ -1049,7 +1049,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		adapters = append(adapters, settingsAdapter{Platform: a.Platform(), Up: a.Healthy()})
 	}
 	var conns []ConnInfo
-	anyQR := false
+	anyPending := false
 	if s.conn != nil {
 		var err error
 		conns, err = s.conn.List(r.Context())
@@ -1057,9 +1057,13 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "list connections: "+err.Error(), 500)
 			return
 		}
+		// A freshly added connection is "starting" (e.g. WeChat is still
+		// fetching its login QR over the network) when the post-Add redirect
+		// renders. Poll through both starting and qr so the QR appears without
+		// a manual reload and clears once the scan completes.
 		for _, c := range conns {
-			if c.State == "qr" {
-				anyQR = true
+			if c.State == "starting" || c.State == "qr" {
+				anyPending = true
 			}
 		}
 	}
@@ -1076,7 +1080,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		AdminBind:      bind,
 		Adapters:       adapters,
 		Connections:    conns,
-		AnyQR:          anyQR,
+		AnyPending:     anyPending,
 	})
 }
 

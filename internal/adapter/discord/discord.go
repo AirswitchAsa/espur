@@ -22,18 +22,35 @@ const MaxChunk = 2000
 
 // Adapter is the Discord implementation.
 type Adapter struct {
-	session *discordgo.Session
-	userID  string
+	session  *discordgo.Session
+	userID   string
+	platform string // routing key returned by Platform(); see WithPlatformKey
 
 	mu      sync.Mutex
 	events  chan adapter.Event
 	healthy atomic.Bool
 }
 
+// Option configures an Adapter at construction.
+type Option func(*Adapter)
+
+// WithPlatformKey overrides the routing key returned by Platform(). The
+// connection manager sets this to the connection's composite identity
+// ("discord:<id>") so multiple Discord connections stay isolated across dedup,
+// transcripts, thread dirs, and outbound routing. Defaults to the bare
+// "discord" when unset (single-connection / legacy).
+func WithPlatformKey(key string) Option {
+	return func(a *Adapter) {
+		if k := strings.TrimSpace(key); k != "" {
+			a.platform = k
+		}
+	}
+}
+
 // New constructs an unstarted Discord adapter. token must be a bot token
 // (decrypted from secrets just before construction; the adapter does not
 // look it up itself).
-func New(token string) (*Adapter, error) {
+func New(token string, opts ...Option) (*Adapter, error) {
 	s, err := discordgo.New("Bot " + strings.TrimSpace(token))
 	if err != nil {
 		return nil, err
@@ -41,10 +58,14 @@ func New(token string) (*Adapter, error) {
 	s.Identify.Intents = discordgo.IntentsGuildMessages |
 		discordgo.IntentsDirectMessages |
 		discordgo.IntentsMessageContent
-	return &Adapter{session: s}, nil
+	a := &Adapter{session: s, platform: "discord"}
+	for _, o := range opts {
+		o(a)
+	}
+	return a, nil
 }
 
-func (a *Adapter) Platform() string { return "discord" }
+func (a *Adapter) Platform() string { return a.platform }
 func (a *Adapter) Healthy() bool    { return a.healthy.Load() }
 
 func (a *Adapter) Start(ctx context.Context) (<-chan adapter.Event, error) {
@@ -54,13 +75,13 @@ func (a *Adapter) Start(ctx context.Context) (<-chan adapter.Event, error) {
 		a.userID = r.User.ID
 		a.healthy.Store(true)
 		a.emit(adapter.Event{Lifecycle: &adapter.LifecycleEvent{
-			Platform: "discord", Kind: adapter.LifecycleConnected, At: time.Now(),
+			Platform: a.Platform(), Kind: adapter.LifecycleConnected, At: time.Now(),
 		}})
 	})
 	a.session.AddHandler(func(_ *discordgo.Session, _ *discordgo.Disconnect) {
 		a.healthy.Store(false)
 		a.emit(adapter.Event{Lifecycle: &adapter.LifecycleEvent{
-			Platform: "discord", Kind: adapter.LifecycleDisconnected, At: time.Now(),
+			Platform: a.Platform(), Kind: adapter.LifecycleDisconnected, At: time.Now(),
 		}})
 	})
 	a.session.AddHandler(a.onMessage)
@@ -121,7 +142,7 @@ func (a *Adapter) onMessage(_ *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 
 	a.emit(adapter.Event{Message: &adapter.MessageEvent{
-		Platform:          "discord",
+		Platform:          a.Platform(),
 		ThreadID:          platformThread,
 		PlatformMessageID: m.ID,
 		Author:            adapter.Author{ID: m.Author.ID, Label: m.Author.Username},

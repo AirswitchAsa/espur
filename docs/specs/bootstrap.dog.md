@@ -17,10 +17,10 @@ The Espur binary is started by the operator (directly, via `air` in dev, or as a
    - `ESPUR_OPENCODE_TIMEOUT` (default `120s`)
    - `ESPUR_OPENCODE_MAX_CONCURRENT` (global cap on concurrent opencode children; default `4`, `0` disables — see [[opencode-invoke]])
    - `ESPUR_SHUTDOWN_DRAIN` (phase-2 drain deadline; default `30s`, floored to `ESPUR_OPENCODE_TIMEOUT` so an in-flight invocation always gets one full attempt window — see [[shutdown]])
-   - `ESPUR_DISCORD_TOKEN` (presence enables the Discord adapter)
-   - `ESPUR_WECHAT_ENABLED` (`1`/`true` opts into the personal-WeChat adapter; QR-login flow per [[adapter]])
+   - `ESPUR_DISCORD_TOKEN` (legacy: seeds a Discord connection on first boot only — see migrate-once below)
+   - `ESPUR_WECHAT_ENABLED` (`1`/`true`; legacy: seeds a WeChat connection on first boot only — see migrate-once below)
    - `XDG_DATA_HOME` (defaults to `$ESPUR_DATA_DIR/xdg-data` if unset; opencode reads its auth file from `$XDG_DATA_HOME/opencode/auth.json`, so this is the shared anchor between `opencode auth login` and Espur's child invocations — see [[oauth]])
-2. **SQLite-persisted state** — vendor list + priority, encrypted credentials, penalty-box state, dedup table. Owned by the web UI at runtime; not editable via env.
+2. **SQLite-persisted state** — vendor list + priority, encrypted credentials, penalty-box state, dedup table, and the connections registry (admin-configured adapter instances; their secrets and WeChat session blobs live in the encrypted credentials table). Owned by the web UI at runtime; not editable via env.
 3. **Compiled-in defaults** — for anything not set by 1 or 2: transcript-tail N, failure-classification patterns, retry/backoff constants, chunking rules, seed-AGENTS.md template, etc.
 
 No config file (YAML/TOML) in v0.1. Env vars + UI cover the surface.
@@ -32,9 +32,9 @@ No config file (YAML/TOML) in v0.1. Env vars + UI cover the surface.
 3. **Open SQLite.** `data/espur.db`. Run migrations idempotently. A failed migration aborts boot.
 4. **Run the secrets self-test** per [[secrets]]: pick any one existing encrypted blob and attempt decryption with the master key. Failure aborts boot.
 5. **Load vendor pool state** from SQLite into memory (priority list, penalty-box). Empty list is a valid state — Espur boots, but [[trigger]] will produce all-drained replies until vendors are configured via the web UI.
-6. **Construct adapters** for each enabled platform whose configuration is present. Adapter construction failure (bad token, malformed config) is logged at error but does **not** abort boot — Espur runs with the remaining adapters, and the web UI surfaces the down adapter. This makes the web UI reachable even when one platform is misconfigured, which is the only way the operator can fix it.
+6. **Construct the web UI and connection manager, then migrate-once.** On the first boot with an empty connections table, the manager seeds a connection per legacy env platform (`ESPUR_DISCORD_TOKEN`, `ESPUR_WECHAT_ENABLED`) using the bare platform key as the connection id, and imports any plaintext `data/wechat-session.json` into the encrypted credentials table (then removes the file). Afterwards the database is the source of truth and those env vars are ignored.
 7. **Start the web UI** on `ESPUR_WEB_PORT`. Failure to bind aborts boot.
-8. **Start each constructed adapter's `Start(ctx)` loop** per [[adapter]]. Failures here surface as `LifecycleEvent`s, not boot aborts.
+8. **Start each enabled connection** via the manager per [[adapter]]: it constructs the adapter, registers it with the core and web status panel, and runs its `Start(ctx)` loop. A construction or start failure for one connection is logged but does **not** abort boot — Espur runs with the remaining connections, and the web UI surfaces the down one (and lets the operator fix it). Failures after start surface as `LifecycleEvent`s.
 9. **Mark process as up.** A simple structured log line `event=boot.ready` is emitted exactly once. The web UI status page shows green.
 
 Boot is considered successful once steps 1–7 complete; steps 8–9 are best-effort. The process exits non-zero only when a step in 1–7 fails.
@@ -43,9 +43,9 @@ Boot is considered successful once steps 1–7 complete; steps 8–9 are best-ef
 
 The complete set of state that survives a restart:
 
-- `data/espur.db` (SQLite): vendor list + priority, encrypted credentials + metadata (BYO API keys), penalty-box state per vendor, message-ID dedup table per platform, any future operator-facing tables.
+- `data/espur.db` (SQLite): vendor list + priority, encrypted credentials + metadata (BYO API keys, plus per-connection Discord tokens and WeChat iLink session blobs under scope `connection`), penalty-box state per vendor, message-ID dedup table per platform, the connections registry, any future operator-facing tables.
 - `$XDG_DATA_HOME/opencode/auth.json` (under `data/xdg-data/` by default): opencode's own auth file holding OAuth bundles. Owned and rotated by `opencode auth login` — see [[oauth]]. Espur reads it for `/oauth` display only.
-- `data/wechat-session.json` (optional, present only when [[adapter]] WeChat is enabled): iLink session state — `bot_token`, `bot_id`, `user_id`, connected `base_url`, and the `getUpdates` long-poll cursor — so subsequent boots skip the QR-login step and resume polling where they left off.
+- The WeChat iLink session (`bot_token`, `bot_id`, `user_id`, connected `base_url`, and the `getUpdates` long-poll cursor) is persisted encrypted in the credentials table for a web-managed connection — so subsequent boots skip the QR-login step and resume polling where they left off. The standalone `cmd/wechat-login` helper still uses a `data/wechat-session.json` file for headless first-login; the migrate-once step imports such a file into the vault and removes it.
 - `data/threads/<platform>/<encoded_id>/`: per-thread working directory containing `AGENTS.md`, any `fact_*.md` opencode wrote, the `transcript.jsonl`, and any opencode-side scratch.
 
 Everything else is process-local and recomputed at boot:

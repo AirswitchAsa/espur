@@ -45,11 +45,29 @@ func TestPost_EmptyBody(t *testing.T) {
 }
 
 func TestPlatformAndHealthy(t *testing.T) {
-	a := &Adapter{}
+	a, err := New("token-x")
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
 	if a.Platform() != "discord" {
-		t.Fatalf("platform=%q", a.Platform())
+		t.Fatalf("default platform=%q want discord", a.Platform())
 	}
 	if a.Healthy() {
 		t.Fatal("unstarted adapter must not be healthy")
+	}
+}
+
+func TestWithPlatformKey(t *testing.T) {
+	a, err := New("token-x", WithPlatformKey("discord:abc123"))
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if a.Platform() != "discord:abc123" {
+		t.Fatalf("platform=%q want discord:abc123", a.Platform())
+	}
+	// Empty key must not clobber the default.
+	b, _ := New("token-x", WithPlatformKey("  "))
+	if b.Platform() != "discord" {
+		t.Fatalf("empty key should keep default, got %q", b.Platform())
 	}
 }

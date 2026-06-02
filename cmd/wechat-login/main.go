@@ -35,11 +35,7 @@ func main() {
 	}
 	storagePath := filepath.Join(dataDir, "wechat-session.json")
 
-	var opts []wechat.Option
-	if bn := os.Getenv("ESPUR_WECHAT_BOT_NAME"); bn != "" {
-		opts = append(opts, wechat.WithBotName(bn))
-	}
-	wa, err := wechat.New(storagePath, opts...)
+	wa, err := wechat.New(wechat.NewFileStore(storagePath))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "wechat-login: %v\n", err)
 		os.Exit(1)

@@ -14,10 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/punny/espur/internal/adapter"
-	"github.com/punny/espur/internal/adapter/discord"
-	"github.com/punny/espur/internal/adapter/wechat"
 	"github.com/punny/espur/internal/bot"
+	"github.com/punny/espur/internal/connman"
 	"github.com/punny/espur/internal/obs"
 	"github.com/punny/espur/internal/secrets"
 	"github.com/punny/espur/internal/store"
@@ -126,78 +124,38 @@ func run() (int, error) {
 	// connections as soon as shutdown begins.
 	adapterCtx, cancelAdapter := context.WithCancel(context.Background())
 
-	// 8. Adapters.
-	var adapters []adapter.Adapter
-	if token := strings.TrimSpace(os.Getenv("ESPUR_DISCORD_TOKEN")); token != "" {
-		d, err := discord.New(token)
-		if err != nil {
-			logger.Error("discord adapter construction failed", "event", obs.AdapterDisconnected, "err", err.Error())
-		} else {
-			core.RegisterAdapter(d)
-			ch, err := d.Start(adapterCtx)
-			if err != nil {
-				logger.Error("discord start failed", "event", obs.AdapterDisconnected, "err", err.Error())
-			} else {
-				adapters = append(adapters, d)
-				go func() {
-					for ev := range ch {
-						// Dispatch uses adapterCtx — it's only used to walk
-						// off the dispatch path quickly. HandleTrigger runs
-						// under a detached exec context inside the bot core.
-						core.Dispatch(adapterCtx, ev)
-					}
-				}()
-			}
-		}
-	} else {
-		logger.Warn("ESPUR_DISCORD_TOKEN unset — Discord adapter not started")
+	// 8. Web UI + connection manager. Connections (adapter instances) are
+	// persisted in the DB and managed at runtime from the web UI; the manager
+	// starts/stops adapters and registers them with the core and the web
+	// status panel. See docs/specs/adapter.dog.md "Connection identity".
+	server := web.New(db, vault, pool, ts)
+	manager := connman.New(db, vault, core, server, logger)
+	server.SetConnManager(manager)
+
+	// Migrate-once: on first boot with no configured connections, seed from the
+	// legacy env vars (and import any plaintext WeChat session file into the
+	// vault) so existing deployments keep working. Afterwards the DB is the
+	// source of truth and these env vars are ignored.
+	seeded, err := manager.Migrate(adapterCtx, dataDir,
+		strings.TrimSpace(os.Getenv("ESPUR_DISCORD_TOKEN")),
+		strings.EqualFold(os.Getenv("ESPUR_WECHAT_ENABLED"), "1") ||
+			strings.EqualFold(os.Getenv("ESPUR_WECHAT_ENABLED"), "true"))
+	if err != nil {
+		logger.Warn("legacy connection migration failed",
+			"event", obs.AdapterDisconnected, "err", err.Error())
+	} else if seeded > 0 {
+		logger.Info("seeded connections from legacy env",
+			"event", obs.BootReady, "count", seeded)
 	}
 
-	// WeChat (personal account via the iLink Bot API). Opt-in: spec/adapter.dog.md
-	// "Platform notes — WeChat" covers the reply-only/context-token semantics and
-	// the QR-image login UX; only start when the operator explicitly asks for it.
-	if strings.EqualFold(os.Getenv("ESPUR_WECHAT_ENABLED"), "1") ||
-		strings.EqualFold(os.Getenv("ESPUR_WECHAT_ENABLED"), "true") {
-		storagePath := filepath.Join(dataDir, "wechat-session.json")
-		var waOpts []wechat.Option
-		if botName := strings.TrimSpace(os.Getenv("ESPUR_WECHAT_BOT_NAME")); botName != "" {
-			waOpts = append(waOpts, wechat.WithBotName(botName))
-		}
-		wa, err := wechat.New(storagePath, waOpts...)
-		if err != nil {
-			logger.Error("wechat adapter construction failed",
-				"event", obs.AdapterDisconnected, "err", err.Error())
-		} else {
-			// iLink's QR payload is a URL to encode (qrcode_img_content), not a
-			// login.weixin.qq.com URL. Render a scannable QR to stderr (stdout
-			// stays clean JSON logs) and also record the event.
-			wa.SetQRCallback(func(imgContent string) {
-				wechat.WriteLoginQR(os.Stderr, imgContent)
-				logger.Info("wechat login QR ready",
-					"event", "wechat.login.qr",
-					"qr_url", imgContent)
-			})
-			core.RegisterAdapter(wa)
-			ch, err := wa.Start(adapterCtx)
-			if err != nil {
-				logger.Error("wechat start failed",
-					"event", obs.AdapterDisconnected, "err", err.Error())
-			} else {
-				adapters = append(adapters, wa)
-				go func() {
-					for ev := range ch {
-						core.Dispatch(adapterCtx, ev)
-					}
-				}()
-			}
-		}
+	// Start all enabled connections.
+	if err := manager.Boot(adapterCtx); err != nil {
+		logger.Error("connection manager boot failed",
+			"event", obs.AdapterDisconnected, "err", err.Error())
 	}
+	conns, _ := manager.List(adapterCtx)
 
 	// 9. Web UI on its own goroutine; we sequence its shutdown ourselves.
-	server := web.New(db, vault, pool, ts)
-	for _, a := range adapters {
-		server.RegisterAdapter(a)
-	}
 	webErrCh := make(chan error, 1)
 	go func() { webErrCh <- server.ListenAndServe(adapterCtx, ":"+webPort) }()
 
@@ -207,7 +165,7 @@ func run() (int, error) {
 		"data_dir", dataDir,
 		"invoke_timeout", invokeTimeout.String(),
 		"drain_deadline", drainDeadline.String(),
-		"adapters", len(adapters),
+		"connections", len(conns),
 	)
 
 	// 10. Wait for first signal OR web crash.
@@ -267,7 +225,7 @@ func run() (int, error) {
 	} else {
 		logger.Info("web shutdown complete", "event", obs.ShutdownWeb)
 	}
-	logger.Info("adapters shutdown complete", "event", obs.ShutdownAdapter, "count", len(adapters))
+	logger.Info("adapters shutdown complete", "event", obs.ShutdownAdapter, "count", len(conns))
 
 	if err := db.Checkpoint(context.Background()); err != nil {
 		logger.Warn("wal checkpoint failed (db still consistent)",

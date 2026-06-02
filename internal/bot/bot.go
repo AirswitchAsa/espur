@@ -67,11 +67,30 @@ func New(cfg Config) *Core {
 }
 
 // RegisterAdapter wires an adapter into the core. Must be called before
-// Dispatch is called for that platform.
+// Dispatch is called for that platform. Safe to call at runtime (the
+// connection manager registers connections as they are started).
 func (c *Core) RegisterAdapter(a adapter.Adapter) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.posters[a.Platform()] = a
+}
+
+// UnregisterAdapter removes the outbound poster for a platform key. Called when
+// a connection is stopped (disabled/deleted) at runtime. In-flight replies that
+// already captured the adapter reference still complete; subsequent lookups for
+// this platform find nothing and the reply is dropped with a logged error.
+func (c *Core) UnregisterAdapter(platform string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.posters, platform)
+}
+
+// poster returns the outbound adapter for a platform key under lock (nil if
+// none). Locked because connections register/unregister at runtime.
+func (c *Core) poster(platform string) adapter.Adapter {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.posters[platform]
 }
 
 // Dispatch is the single entry point for inbound adapter events. Returns
@@ -246,7 +265,7 @@ func (c *Core) HandleTrigger(ctx context.Context, m *adapter.MessageEvent) {
 		c.cfg.Logger.Error("vendor pool failed", "err", err, "outcome", res.Outcome)
 	}
 
-	a := c.posters[m.Platform]
+	a := c.poster(m.Platform)
 	if a == nil {
 		c.cfg.Logger.Error("no adapter registered", "platform", m.Platform)
 		return
@@ -298,7 +317,7 @@ func (c *Core) HandleTrigger(ctx context.Context, m *adapter.MessageEvent) {
 }
 
 func (c *Core) postCrash(ctx context.Context, m *adapter.MessageEvent, reason string) {
-	a := c.posters[m.Platform]
+	a := c.poster(m.Platform)
 	if a == nil {
 		return
 	}

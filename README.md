@@ -48,8 +48,7 @@ dog lint docs/specs
 ESPUR_MASTER_KEY=AGE-SECRET-KEY-1...
 ESPUR_LOG_LEVEL=debug
 # ESPUR_DISCORD_TOKEN=...
-# ESPUR_WECHAT_ENABLED=1          # personal account via the iLink Bot API (QR-login at first run)
-# ESPUR_WECHAT_BOT_NAME=espur-bot # only needed to detect @-mentions in WeChat groups
+# ESPUR_WECHAT_ENABLED=1          # personal account via the iLink Bot API (QR-login at first run; DM-only)
 ```
 
 ## Docs

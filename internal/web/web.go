@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -49,16 +50,47 @@ type AdapterHealth interface {
 	Healthy() bool
 }
 
+// ConnInfo is the merged DB + runtime view of one connection shown in the UI.
+type ConnInfo struct {
+	ID      string
+	Kind    string
+	Label   string
+	State   string // stopped | starting | qr | connected | disconnected | auth_revoked
+	QR      string // pending login QR payload (WeChat), empty otherwise
+	Enabled bool
+	Healthy bool
+}
+
+// ConnManager is the connection-management surface the UI drives. Implemented
+// by *connman.Manager; an interface here keeps web free of a connman import.
+type ConnManager interface {
+	List(ctx context.Context) ([]ConnInfo, error)
+	AddDiscord(ctx context.Context, token string) error
+	AddWeChat(ctx context.Context) error
+	Enable(ctx context.Context, id string) error
+	Disable(ctx context.Context, id string) error
+	Delete(ctx context.Context, id string) error
+	Status(id string) (state, qr string)
+}
+
 // Server is the admin UI HTTP server.
 type Server struct {
-	db       *store.DB
-	vault    *secrets.Vault
-	pool     *vendor.Pool
-	ts       *transcript.Store
-	tmpl     *template.Template
-	adapters []AdapterHealth
-	bind     string
+	db    *store.DB
+	vault *secrets.Vault
+	pool  *vendor.Pool
+	ts    *transcript.Store
+	tmpl  *template.Template
+	bind  string
+
+	mu       sync.Mutex      // guards adapters (register/unregister at runtime)
+	adapters []AdapterHealth // status sources; keyed implicitly by Platform()
+
+	conn ConnManager // connection management; nil until SetConnManager
 }
+
+// SetConnManager wires the connection manager so the UI can list and mutate
+// connections. Called once at boot, before ListenAndServe.
+func (s *Server) SetConnManager(c ConnManager) { s.conn = c }
 
 // New wires the admin server.
 func New(db *store.DB, vault *secrets.Vault, pool *vendor.Pool, ts *transcript.Store) *Server {
@@ -80,9 +112,43 @@ func New(db *store.DB, vault *secrets.Vault, pool *vendor.Pool, ts *transcript.S
 	return s
 }
 
-// RegisterAdapter wires an adapter into status reporting. Boot-only.
+// RegisterAdapter wires an adapter into status reporting. Safe at runtime; the
+// connection manager (re)registers as connections start. Re-registering the
+// same Platform() replaces the prior entry.
 func (s *Server) RegisterAdapter(a AdapterHealth) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, existing := range s.adapters {
+		if existing.Platform() == a.Platform() {
+			s.adapters[i] = a
+			return
+		}
+	}
 	s.adapters = append(s.adapters, a)
+}
+
+// UnregisterAdapter removes a status source by platform key (connection
+// stopped/deleted at runtime).
+func (s *Server) UnregisterAdapter(platform string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.adapters[:0]
+	for _, a := range s.adapters {
+		if a.Platform() != platform {
+			out = append(out, a)
+		}
+	}
+	s.adapters = out
+}
+
+// snapshotAdapters returns a copy of the registered adapters for safe iteration
+// without holding the lock across template rendering / IO.
+func (s *Server) snapshotAdapters() []AdapterHealth {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]AdapterHealth, len(s.adapters))
+	copy(out, s.adapters)
+	return out
 }
 
 // Handler returns the http.Handler to mount on the admin port.
@@ -108,6 +174,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /threads/{platform}/{enc_id}/instructions", s.threadInstructions)
 	mux.HandleFunc("POST /threads/{platform}/{enc_id}/delete", s.threadDelete)
 	mux.HandleFunc("GET /settings", s.settings)
+	mux.HandleFunc("POST /connections/discord", s.connAddDiscord)
+	mux.HandleFunc("POST /connections/wechat", s.connAddWeChat)
+	mux.HandleFunc("POST /connections/{id}/enable", s.connEnable)
+	mux.HandleFunc("POST /connections/{id}/disable", s.connDisable)
+	mux.HandleFunc("POST /connections/{id}/delete", s.connDelete)
+	mux.HandleFunc("GET /connections/{id}/qr.png", s.connQR)
 	mux.HandleFunc("GET /health", s.healthPage)
 	return mux
 }
@@ -139,7 +211,7 @@ type stripData struct {
 func (s *Server) buildStrip(ctx context.Context) stripData {
 	var sd stripData
 	sd.Version = Version
-	for _, a := range s.adapters {
+	for _, a := range s.snapshotAdapters() {
 		sd.Adapters = append(sd.Adapters, stripAdapter{Platform: a.Platform(), Up: a.Healthy()})
 	}
 	vs, _ := s.db.ListVendors(ctx)
@@ -270,7 +342,7 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 
 	var adapters []homeAdapter
 	threadsByPlatform := s.threadsByPlatform()
-	for _, a := range s.adapters {
+	for _, a := range s.snapshotAdapters() {
 		adapters = append(adapters, homeAdapter{
 			Platform: a.Platform(), Up: a.Healthy(), Threads: threadsByPlatform[a.Platform()],
 		})
@@ -967,12 +1039,29 @@ type settingsPage struct {
 	DataDir        string
 	AdminBind      string
 	Adapters       []settingsAdapter
+	Connections    []ConnInfo
+	AnyQR          bool // a connection is awaiting a login QR scan → auto-refresh
 }
 
-func (s *Server) settings(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	var adapters []settingsAdapter
-	for _, a := range s.adapters {
+	for _, a := range s.snapshotAdapters() {
 		adapters = append(adapters, settingsAdapter{Platform: a.Platform(), Up: a.Healthy()})
+	}
+	var conns []ConnInfo
+	anyQR := false
+	if s.conn != nil {
+		var err error
+		conns, err = s.conn.List(r.Context())
+		if err != nil {
+			http.Error(w, "list connections: "+err.Error(), 500)
+			return
+		}
+		for _, c := range conns {
+			if c.State == "qr" {
+				anyQR = true
+			}
+		}
 	}
 	bind := s.bind
 	if bind == "" {
@@ -986,6 +1075,8 @@ func (s *Server) settings(w http.ResponseWriter, _ *http.Request) {
 		DataDir:        s.ts.BaseDir,
 		AdminBind:      bind,
 		Adapters:       adapters,
+		Connections:    conns,
+		AnyQR:          anyQR,
 	})
 }
 
@@ -1015,7 +1106,7 @@ func (s *Server) healthPage(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var up, total int
 	var labels []string
-	for _, a := range s.adapters {
+	for _, a := range s.snapshotAdapters() {
 		total++
 		if a.Healthy() {
 			up++
@@ -1062,7 +1153,7 @@ func (s *Server) healthPage(w http.ResponseWriter, r *http.Request) {
 		NumThreads:       s.countThreads(),
 		FreeDisk:         humanBytes(freeDiskBytes(s.ts.BaseDir)),
 	}
-	page.RawJSON = healthzJSON(s.adapters)
+	page.RawJSON = healthzJSON(s.snapshotAdapters())
 	s.render(w, "health", page)
 }
 

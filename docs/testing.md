@@ -162,8 +162,9 @@ curl -fsS http://localhost:8080/healthz && echo OK
 
 WeChat is opt-in and uses QR login. Add `-e ESPUR_WECHAT_ENABLED=1` to step 3,
 then watch the logs / UI for the login QR on first run and scan it with the
-WeChat app. Group mentions (`@bot ...`) trigger; plain DMs do not mention at the
-adapter layer.
+WeChat app. Only DMs are supported (each DM is an implicit mention and triggers
+a reply); group chats are not — Tencent's grayscale ClawBot does not deliver
+group messages.
 
 ## 13. Teardown
 

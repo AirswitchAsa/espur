@@ -18,7 +18,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		OK       bool    `json:"ok"`
 		Adapters []entry `json:"adapters"`
 	}{OK: true}
-	for _, a := range s.adapters {
+	for _, a := range s.snapshotAdapters() {
 		h := a.Healthy()
 		out.Adapters = append(out.Adapters, entry{Platform: a.Platform(), Healthy: h})
 		if !h {

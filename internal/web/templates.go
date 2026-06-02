@@ -735,29 +735,54 @@ const settingsTpl = `{{ define "settings" }}
     </div>
 
     <div class="es-set-block" style="grid-column: 1 / -1">
-      <div class="es-set-block__head"><span class="es-set-block__title">adapters</span><span class="es-restart-tag">restart to change</span></div>
+      <div class="es-set-block__head"><span class="es-set-block__title">connections</span></div>
       <div class="es-set-block__body">
-        {{ range .Adapters }}
+        {{ range .Connections }}
         <div class="es-set-row">
           <div class="es-set-row__l">
             <span class="es-set-row__name">
-              <span class="es-plat">{{ if eq .Platform "discord" }}{{ template "icon-hash" }}{{ else }}{{ template "icon-msg" }}{{ end }}</span>
-              {{ .Platform }}
+              <span class="es-plat">{{ if eq .Kind "discord" }}{{ template "icon-hash" }}{{ else }}{{ template "icon-msg" }}{{ end }}</span>
+              {{ .Label }}
             </span>
-            <span class="es-set-row__hint">{{ if .Up }}connected{{ else }}disconnected{{ end }}</span>
+            <span class="es-set-row__hint"><span class="es-cell-mono">{{ .ID }}</span> · {{ .State }}{{ if not .Enabled }} · disabled{{ end }}</span>
+            {{ if and (eq .State "qr") .QR }}
+            <div style="margin-top: 10px">
+              <img src="/connections/{{ .ID }}/qr.png" alt="WeChat login QR" width="180" height="180" style="background:#fff;padding:8px;border-radius:8px" />
+              <div class="es-spec" style="margin-top:6px">Scan with the WeChat mobile app to log in.</div>
+            </div>
+            {{ end }}
           </div>
-          <div class="es-set-row__r">
-            <span class="es-status {{ if .Up }}es-status--ok{{ else }}es-status--danger{{ end }}">
-              <span class="es-status__dot"></span>{{ if .Up }}live{{ else }}down{{ end }}
+          <div class="es-set-row__r" style="display:flex;align-items:center;gap:10px">
+            <span class="es-status {{ if .Healthy }}es-status--ok{{ else }}es-status--danger{{ end }}">
+              <span class="es-status__dot"></span>{{ if .Healthy }}live{{ else }}down{{ end }}
             </span>
+            {{ if .Enabled }}
+            <form method="post" action="/connections/{{ .ID }}/disable" style="display:inline"><button class="es-btn es-btn--ghost" type="submit">Disable</button></form>
+            {{ else }}
+            <form method="post" action="/connections/{{ .ID }}/enable" style="display:inline"><button class="es-btn es-btn--ghost" type="submit">Enable</button></form>
+            {{ end }}
+            <form method="post" action="/connections/{{ .ID }}/delete" style="display:inline" onsubmit="return confirm('Delete this connection and its stored credential?')"><button class="es-btn es-btn--danger" type="submit">Delete</button></form>
           </div>
         </div>
         {{ else }}
-        <div class="es-empty__sub" style="padding: 16px 0">No adapters registered.</div>
+        <div class="es-empty__sub" style="padding: 16px 0">No connections yet. Add one below.</div>
         {{ end }}
+
+        <div class="es-set-row" style="align-items:flex-start;gap:16px;flex-wrap:wrap">
+          <form method="post" action="/connections/discord" style="display:flex;gap:8px;align-items:center;flex:1;min-width:280px">
+            <span class="es-plat">{{ template "icon-hash" }}</span>
+            <input class="es-input" type="password" name="token" placeholder="Discord bot token" style="flex:1" />
+            <button class="es-btn es-btn--primary" type="submit">Add Discord</button>
+          </form>
+          <form method="post" action="/connections/wechat" style="display:flex;gap:8px;align-items:center">
+            <span class="es-plat">{{ template "icon-msg" }}</span>
+            <button class="es-btn es-btn--primary" type="submit">Add WeChat (QR login)</button>
+          </form>
+        </div>
       </div>
     </div>
   </div>
+  {{ if .AnyQR }}<script>setTimeout(function(){location.reload();},2500);</script>{{ end }}
 </div>
 {{ end }}`
 

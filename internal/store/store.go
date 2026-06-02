@@ -96,6 +96,21 @@ var migrations = []string{
 		seen_at    INTEGER NOT NULL,
 		PRIMARY KEY (platform, message_id)
 	);`,
+	// 6: connections — admin-configured adapter instances. id is the composite
+	// routing key (kind:<gen> for UI-created, bare kind for the migrated legacy
+	// connection). The bot token / iLink session blob lives in credentials
+	// (scope='connection', id=connection id), never here. config is small
+	// non-secret JSON (e.g. base_url). label is a human display name derived
+	// from the platform after connect. See docs/specs/adapter.dog.md.
+	`CREATE TABLE IF NOT EXISTS connections (
+		id         TEXT PRIMARY KEY,
+		kind       TEXT NOT NULL,
+		label      TEXT NOT NULL DEFAULT '',
+		enabled    INTEGER NOT NULL DEFAULT 1,
+		config     TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	);`,
 }
 
 func (d *DB) migrate() error {

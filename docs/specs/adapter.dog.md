@@ -2,7 +2,7 @@
 
 ## Condition
 
-Espur is configured with one or more IM platforms (Discord, WeChat, Slack, ...). At process start, `cmd/espur/main.go` constructs one **Adapter** per enabled platform and calls `Start(ctx)`. Each adapter owns its transport (gateway WebSocket, webhook listener, long-poll loop, etc.) and is the **only** component in Espur that knows that platform's wire format, mention semantics, and chunking limits.
+Espur is configured with zero or more **connections**, each one a configured instance of an IM platform (Discord, WeChat, Slack, ...). At process start, and whenever the admin adds a connection at runtime, the **connection manager** constructs one **Adapter** per enabled connection and calls `Start(ctx)`. Multiple connections of the same platform are allowed — each is an independent bot login with its own transport, its own credential, and its own identity. Each adapter owns its transport (gateway WebSocket, webhook listener, long-poll loop, etc.) and is the **only** component in Espur that knows that platform's wire format, mention semantics, and chunking limits.
 
 ## Description
 
@@ -14,7 +14,7 @@ Adapters are driving + driven: they push inbound events into the bot core throug
 
 - `Start(ctx) (<-chan Event, error)` — begin listening. Returns the inbound event channel. Caller cancels `ctx` to stop. On clean shutdown the adapter closes the channel after draining.
 - `Post(ctx, threadID, body) (platformMessageID, error)` — synchronous post of one logical reply. Adapter performs chunking and any small bounded retry internally. Returns the platform-native id of the **first chunk** so the transcript record correlates.
-- `Platform() string` — stable identifier, e.g. `"discord"`. Used as the `platform` field in every emitted event and every persisted record.
+- `Platform() string` — stable connection identity. Used as the `platform` field in every emitted event and every persisted record, and as the routing key throughout the core (dedup, transcripts, thread working dirs, outbound poster lookup). See "Connection identity" below.
 - `Healthy() bool` — cheap, non-blocking, atomic read. True iff transport is currently connected and the last successful heartbeat / inbound is within a platform-appropriate freshness window. Backs the web UI status panel.
 
 **Event types** (sum, single channel).
@@ -81,6 +81,14 @@ Both variants ride the same channel. Ordering inside the channel reflects the or
 - Request IDs from [[reply]] appear in both adapter and core logs whenever the failure was bot-side; this is the join key for operator triage.
 - Message bodies are never logged. Author labels and message ids are.
 
+### Connection identity & multi-connection
+
+A **connection** is a persisted, admin-configured instance of a platform. The admin does not type a free-text name; they select a platform **type** (Discord, WeChat, ...) and supply its credential (Discord: a bot token; WeChat: a QR scan). The system assigns each connection a stable, opaque **connection id** at creation, and the adapter's `Platform()` returns the composite key `kind:id` (e.g. `wechat:7Gx9q2`). That composite is the only identity the rest of Espur sees, and because dedup, transcripts, thread working dirs, and the outbound poster map are all keyed on it, two connections of the same platform are fully isolated with no shared state — there is no shared session, cursor, or client between them.
+
+The single exception is the **migrated legacy connection**: when an existing deployment first boots after this feature lands, the manager seeds one connection per pre-existing env-configured platform using the **bare** platform key (`wechat`, `discord`) as its id, so existing thread history, transcripts, and dedup rows keep resolving. New connections created through the web UI always get a generated id.
+
+A human-readable **label** for the UI is derived from the platform after connect (the Discord bot username, the WeChat bot id) rather than entered by the admin.
+
 ### Adapter: WeChat (iLink Bot API)
 
 The WeChat adapter (`internal/adapter/wechat/`) talks to Tencent's **personal-account iLink Bot API** (`https://ilinkai.weixin.qq.com`) via the Go SDK [`github.com/openilink/openilink-sdk-go`](https://github.com/openilink/openilink-sdk-go) (MIT, pinned at v0.6.0). It replaces the earlier Web/Desktop WeChat protocol (`openwechat`), which Tencent actively bans. iLink is the officially sanctioned personal-bot transport, so it is the lower-ban-risk path — but it is still **personal / non-commercial** and opt-in (`ESPUR_WECHAT_ENABLED=1`).
@@ -89,30 +97,25 @@ The WeChat adapter (`internal/adapter/wechat/`) talks to Tencent's **personal-ac
 
 - **Login.** QR-code scan → `bot_token`. The SDK's `LoginWithQR` fetches a QR and surfaces it through an `OnQRCode(imgContent)` callback. The payload is the **QR image content** (`qrcode_img_content`), *not* a `login.weixin.qq.com/qrcode/<uuid>` URL as in the old protocol. The operator scans it from the WeChat mobile client; the SDK polls scan status (`wait`/`scaned`/`confirmed`/`expired`) until connected, then returns `{Connected, BotToken, BotID, UserID, BaseURL}`.
 - **Inbound.** Long-poll (`getUpdates`). The SDK's `Monitor(ctx, handler, opts)` runs the poll loop, auto-retry/backoff, and a server-driven dynamic timeout. Each `WeixinMessage` carries `FromUserID`, optional `GroupID`, `ContextToken`, `MessageType` (user vs. bot), and an `ItemList` of typed content items. `ilink.ExtractText` collapses text + quoted-reply + voice-transcription items into a single body string.
-- **Outbound.** Reply-only. `SendText(ctx, toUserID, text, contextToken)` for DMs; low-level `SendMessage` with a `GroupID`-addressed envelope for groups (see below). The SDK has no persistent socket — `Post` is a single HTTP round-trip per chunk.
+- **Outbound.** Reply-only, DM only. `SendText(ctx, toUserID, text, contextToken)`. The SDK has no persistent socket — `Post` is a single HTTP round-trip per chunk.
 
-**Context-token threading (the key constraint).** Every iLink reply must echo the `context_token` observed on the *inbound* message it answers. But `Adapter.Post(ctx, threadID, body)` carries no token. Resolution: the adapter caches, per `ThreadID`, the latest `context_token` seen inbound (along with whether that thread is a group). `Post` looks the token up and threads it into the send call. The SDK also keeps its own per-`FromUserID` token cache for `Push`, but the adapter keeps an authoritative cache of its own so DM **and** group threads are handled uniformly and the behaviour is testable without the live API.
+**Context-token threading (the key constraint).** Every iLink reply must echo the `context_token` observed on the *inbound* message it answers. But `Adapter.Post(ctx, threadID, body)` carries no token. Resolution: the adapter caches, per `ThreadID`, the latest `context_token` seen inbound. `Post` looks the token up and threads it into the send call. The SDK also keeps its own per-`FromUserID` token cache for `Push`, but the adapter keeps an authoritative cache of its own so the behaviour is testable without the live API.
 
-**Reply-only (no cold open).** Like a Telegram bot, the adapter cannot initiate a conversation with a user/group that has never messaged it — without a cached `context_token` there is nothing to echo. If `Post` is called for a `ThreadID` with no cached token, it returns `ErrThreadGone`; the core handles that as a downgraded crash outcome (not an Espur bug).
+**Reply-only (no cold open).** Like a Telegram bot, the adapter cannot initiate a conversation with a user that has never messaged it — without a cached `context_token` there is nothing to echo. If `Post` is called for a `ThreadID` with no cached token, it returns `ErrThreadGone`; the core handles that as a downgraded crash outcome (not an Espur bug).
 
-**ThreadID mapping.**
+**ThreadID mapping (DM only).** `ThreadID == FromUserID` (the peer's iLink user id). `Mention` is always `true` (implicit DM mention).
 
-- **DM:** `ThreadID == FromUserID` (the peer's iLink user id). `Mention` is always `true` (implicit DM mention).
-- **Group:** `ThreadID == GroupID`. The whole group is one thread; replies go to the group. `Author{ID,Label}` is the individual sender. `Mention` is `true` only when the bot is at-mentioned.
-
-**Group support — best-effort, unverified against the live API.** v0.6.0 *surfaces* inbound group messages (`GroupID` populated) but exposes **no** group-send helper: `SendText`/`Push` only address an individual `ToUserID`, and the SDK's own token cache keys on `FromUserID`. The shared `WeixinMessage` envelope that the `sendmessage` endpoint accepts *does* carry a `group_id` field, so the adapter replies to groups by hand-building a `SendMessage` request with `GroupID` set and the inbound `context_token` echoed. This path is the protocol's apparent intent but is **not exercised by the SDK helpers and has not been verified against a live iLink account**; it is marked as such in code and may need adjustment once smoke-tested. DMs use the blessed `SendText` helper and are the verified path.
-
-**Group at-mention detection.** iLink does not surface mentions structurally — only as text. Detection matches an `@`-prefixed token against the bot's configured display name, supplied via `ESPUR_WECHAT_BOT_NAME` (the SDK login result does not include a nickname). **If the bot name is unset, group at-mentions cannot be detected and the bot will not auto-respond in groups** (DMs are unaffected). This is logged and documented rather than silently reducing scope.
+**Group chats are unsupported.** Tencent's grayscale ClawBot does not deliver group messages, and the v0.6.0 SDK exposes no group-send helper (`SendText`/`Push` address an individual `ToUserID`; the token cache keys on `FromUserID`). Inbound messages with a populated `GroupID` are dropped defensively, and the adapter never sends to a group. Group support waits on the platform shipping it.
 
 **Self-echo and bot identity.** A QR login provisions a **new bot** (its own `BotID`, an `im.bot`-suffixed id) that the scanning account *owns*; the login `UserID` is that human operator (an `im.wechat`-suffixed id), **not** the bot. `Monitor` may redeliver the bot's own outbound messages; they arrive with `MessageType == MsgTypeBot`, so the normalizer drops any non-user message and replies never loop. It deliberately does **not** filter on `UserID` — that would drop the operator's own legitimate messages to their bot.
 
-**Persistence.** Replaces the old `openwechat` hot-reload blob. The adapter persists `bot_token`, `bot_id`, `user_id`, the connected `base_url`, and the `getUpdates` cursor (`buf`) to `data/wechat-session.json` (mode 0600, atomic write). On boot: if a saved `bot_token` exists, the QR step is skipped, the saved `base_url` is restored, and `Monitor` resumes from `InitialBuf = <saved cursor>`; `OnBufUpdate` persists the cursor as it advances.
+**Persistence.** Replaces the old `openwechat` hot-reload blob. The adapter persists `bot_token`, `bot_id`, `user_id`, the connected `base_url`, and the `getUpdates` cursor (`buf`) as one JSON session blob, written through an injected session store rather than a hard-coded path. A web-managed connection backs that store with the encrypted credentials table (scope `connection`), so the secret never lands on disk in plaintext; the standalone `cmd/wechat-login` helper backs it with a `data/wechat-session.json` file (mode 0600, atomic write) for headless first-login. On boot: if a saved `bot_token` exists, the QR step is skipped, the saved `base_url` is restored, and `Monitor` resumes from `InitialBuf` equal to the saved cursor; `OnBufUpdate` persists the cursor as it advances.
 
 **Lifecycle.** `Connected` after a successful login/resume. `AuthRevoked` when the server reports session expiry (`errcode -14`, surfaced via `OnSessionExpired`); on that event the adapter wipes the persisted token so the next boot forces a fresh QR scan. `Disconnected` on an unexpected `Monitor` exit. There is no gateway heartbeat, so `Healthy()` reflects the login/poll state rather than a socket.
 
 ## Outcome
 
-Each enabled platform has exactly one running `Adapter` whose `Start`-returned channel is the sole inbound path for that platform and whose `Post` method is the sole outbound path. All platform-specific knowledge (wire formats, mention semantics, chunking limits, signature schemes, reconnect strategy) is contained inside the adapter package; swapping or adding a platform is a matter of adding one package under `internal/adapter/<platform>/` and registering it in `cmd/espur/main.go`. Failures inside the adapter never produce a user-visible message of their own — they surface via logs and the web UI status panel; user-visible replies are exclusively the four forms defined in [[reply]].
+Each enabled connection has exactly one running `Adapter` whose `Start`-returned channel is the sole inbound path for that connection and whose `Post` method is the sole outbound path; the connection's `kind:id` identity keeps multiple connections of the same platform fully isolated. All platform-specific knowledge (wire formats, mention semantics, chunking limits, signature schemes, reconnect strategy) is contained inside the adapter package; adding a platform is a matter of adding one package under `internal/adapter/<platform>/` and teaching the connection manager to construct it. Connections are created, enabled, disabled, and deleted at runtime from the web UI and persisted in the database; the connection manager starts and stops adapters to match. Failures inside the adapter never produce a user-visible message of their own — they surface via logs and the web UI status panel; user-visible replies are exclusively the four forms defined in [[reply]].
 
 ## Notes
 

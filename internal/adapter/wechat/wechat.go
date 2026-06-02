@@ -14,19 +14,17 @@
 //   - Outbound: reply-only. The adapter caches the latest context_token per
 //     thread and threads it into the send call. A Post to a thread with no
 //     cached token returns adapter.ErrThreadGone.
-//   - DMs are the verified path (SendText). Group replies are best-effort via
-//     the low-level SendMessage envelope and are unverified against the live API.
+//   - DMs are the only supported conversation. Tencent's grayscale ClawBot does
+//     not deliver group messages, so inbound group messages are dropped and the
+//     adapter never sends to a group. Group support waits on the platform.
 package wechat
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -53,16 +51,7 @@ type ilinkClient interface {
 	LoginWithQR(ctx context.Context, cb *ilink.LoginCallbacks) (*ilink.LoginResult, error)
 	Monitor(ctx context.Context, handler ilink.MessageHandler, opts *ilink.MonitorOptions) error
 	SendText(ctx context.Context, to, text, contextToken string) (string, error)
-	SendMessage(ctx context.Context, req *ilink.SendMessageReq) error
 	SetBaseURL(url string)
-}
-
-// threadRef is the cached state the adapter needs to reply on a thread: the
-// latest inbound context_token, and whether the thread is a group (which
-// changes how Post addresses the outbound message).
-type threadRef struct {
-	token string
-	group bool
 }
 
 // session is the persisted boot state. Replaces the openwechat hot-reload blob.
@@ -76,9 +65,9 @@ type session struct {
 
 // Adapter implements adapter.Adapter for personal WeChat over iLink.
 type Adapter struct {
-	storagePath string
-	baseURL     string // optional WithBaseURL override (tests / self-host)
-	botName     string // for group @-mention detection; "" disables it
+	store    SessionStore // persists the session blob; see session_store.go
+	baseURL  string       // optional WithBaseURL override (tests / self-host)
+	platform string       // routing key returned by Platform(); see WithPlatformKey
 
 	// newClient builds the SDK client for a given bot token. Injectable so
 	// tests can supply a fake; defaults to a real *ilink.Client in New.
@@ -88,12 +77,10 @@ type Adapter struct {
 	// default (emit a structured line on stdout). Injectable for tests.
 	qrCallback func(imgContent string)
 
-	mu        sync.Mutex
-	client    ilinkClient
-	threads   map[string]threadRef
-	sess      session
-	botID     string
-	botUserID string
+	mu      sync.Mutex
+	client  ilinkClient
+	threads map[string]string // threadID (FromUserID) -> latest context_token
+	sess    session
 
 	events  chan adapter.Event
 	healthy atomic.Bool
@@ -108,11 +95,17 @@ func WithBaseURL(url string) Option {
 	return func(a *Adapter) { a.baseURL = strings.TrimSpace(url) }
 }
 
-// WithBotName sets the bot display name used to detect "@<botName>" mentions in
-// group chats. iLink's login result does not include a nickname, so this must
-// be supplied by the operator; if empty, group mentions are never detected.
-func WithBotName(name string) Option {
-	return func(a *Adapter) { a.botName = strings.TrimSpace(name) }
+// WithPlatformKey overrides the routing key returned by Platform(). The
+// connection manager sets this to the connection's composite identity
+// ("wechat:<id>") so multiple WeChat connections stay isolated across dedup,
+// transcripts, thread dirs, and outbound routing. Defaults to the bare
+// "wechat" when unset (single-connection / legacy).
+func WithPlatformKey(key string) Option {
+	return func(a *Adapter) {
+		if k := strings.TrimSpace(key); k != "" {
+			a.platform = k
+		}
+	}
 }
 
 // withClient injects a client factory. Test-only.
@@ -120,16 +113,18 @@ func withClient(factory func(token string) ilinkClient) Option {
 	return func(a *Adapter) { a.newClient = factory }
 }
 
-// New constructs an unstarted WeChat adapter. storagePath is the JSON file at
-// which the adapter persists the post-login session (bot token + base URL +
-// poll cursor) so subsequent boots skip the QR scan. The directory MUST exist.
-func New(storagePath string, opts ...Option) (*Adapter, error) {
-	if strings.TrimSpace(storagePath) == "" {
-		return nil, errors.New("wechat: storage path is required")
+// New constructs an unstarted WeChat adapter. store persists the post-login
+// session (bot token + base URL + poll cursor) so subsequent boots skip the QR
+// scan; use NewFileStore for a file, or a vault-backed store for a web-managed
+// connection.
+func New(store SessionStore, opts ...Option) (*Adapter, error) {
+	if store == nil {
+		return nil, errors.New("wechat: session store is required")
 	}
 	a := &Adapter{
-		storagePath: storagePath,
-		threads:     make(map[string]threadRef),
+		store:    store,
+		platform: "wechat",
+		threads:  make(map[string]string),
 	}
 	for _, o := range opts {
 		o(a)
@@ -146,7 +141,7 @@ func New(storagePath string, opts ...Option) (*Adapter, error) {
 	return a, nil
 }
 
-func (a *Adapter) Platform() string { return "wechat" }
+func (a *Adapter) Platform() string { return a.platform }
 func (a *Adapter) Healthy() bool    { return a.healthy.Load() }
 
 // SetQRCallback overrides what happens when iLink emits the login QR image. The
@@ -212,8 +207,6 @@ func (a *Adapter) run(ctx context.Context) {
 
 	a.mu.Lock()
 	a.sess = sess
-	a.botID = sess.BotID
-	a.botUserID = sess.UserID
 	a.mu.Unlock()
 
 	a.healthy.Store(true)
@@ -292,8 +285,9 @@ func (a *Adapter) emit(ev adapter.Event) {
 }
 
 // onMessage runs on Monitor's goroutine. It drops the bot's own echoes and
-// system/bot messages, normalizes the body, caches the reply token, and emits a
-// MessageEvent. DMs map ThreadID -> FromUserID; groups map ThreadID -> GroupID.
+// group messages, normalizes the body, caches the reply token, and emits a
+// MessageEvent. The thread is the DM peer (ThreadID -> FromUserID); a DM is
+// always an implicit mention, like Discord.
 func (a *Adapter) onMessage(msg ilink.WeixinMessage) {
 	// Self-echo: the bot's own outbound (and any bot-generated message)
 	// arrives with MessageType == MsgTypeBot; drop it so replies never loop.
@@ -304,25 +298,19 @@ func (a *Adapter) onMessage(msg ilink.WeixinMessage) {
 	if msg.MessageType == ilink.MsgTypeBot {
 		return
 	}
-	a.mu.Lock()
-	botName := a.botName
-	a.mu.Unlock()
+	// Groups are unsupported (Tencent grayscale does not deliver them, and the
+	// adapter never sends to one). Drop defensively if one ever arrives.
+	if msg.GroupID != "" {
+		return
+	}
 
-	isGroup := msg.GroupID != ""
 	threadID := msg.FromUserID
-	if isGroup {
-		threadID = msg.GroupID
-	}
-
-	body, mentioned := normalizeMessage(&msg, botName)
-	if !isGroup {
-		mentioned = true // DM is an implicit mention, like Discord.
-	}
+	body := normalizeMessage(&msg)
 
 	// Cache the latest context_token for this thread so Post can echo it.
 	if msg.ContextToken != "" {
 		a.mu.Lock()
-		a.threads[threadID] = threadRef{token: msg.ContextToken, group: isGroup}
+		a.threads[threadID] = msg.ContextToken
 		a.mu.Unlock()
 	}
 
@@ -332,7 +320,7 @@ func (a *Adapter) onMessage(msg ilink.WeixinMessage) {
 		PlatformMessageID: strconv.FormatInt(msg.MessageID, 10),
 		Author:            adapter.Author{ID: msg.FromUserID, Label: msg.FromUserID},
 		Body:              body,
-		Mention:           mentioned,
+		Mention:           true, // DM is an implicit mention, like Discord.
 		ReceivedAt:        time.Now(),
 	}})
 }
@@ -341,14 +329,14 @@ func (a *Adapter) onMessage(msg ilink.WeixinMessage) {
 // (the trailing rune is a four-per-em space, U+2005).
 var mentionTrailer = regexp.MustCompile(`@([^\s\x{2005}]+)\x{2005}?`)
 
-// normalizeMessage extracts the body (text, or a media placeholder when the
-// message carries no text) and reports whether the bot was @-mentioned.
-func normalizeMessage(msg *ilink.WeixinMessage, botName string) (string, bool) {
+// normalizeMessage extracts the body: the message text, or a media placeholder
+// when the message carries no text.
+func normalizeMessage(msg *ilink.WeixinMessage) string {
 	text := ilink.ExtractText(msg)
 	if text == "" {
 		text = mediaPlaceholder(msg)
 	}
-	return normalizeBody(text, botName)
+	return normalizeBody(text)
 }
 
 // mediaPlaceholder renders attachment-only messages to a placeholder token,
@@ -370,18 +358,11 @@ func mediaPlaceholder(msg *ilink.WeixinMessage) string {
 	return strings.Join(parts, " ")
 }
 
-// normalizeBody strips "@<botname>" mention tokens from the body and reports
-// whether the bot was mentioned. iLink does not expose mentions structurally,
-// only as text, so this matches the configured bot display name. If botName is
-// empty (operator did not configure ESPUR_WECHAT_BOT_NAME), mentions are never
-// detected. Stray "@xxx" tokens are stripped as ornamentation either way.
-func normalizeBody(content, botName string) (string, bool) {
-	mentioned := false
-	if botName != "" && strings.Contains(content, "@"+botName) {
-		mentioned = true
-	}
+// normalizeBody strips stray "@xxx" mention tokens from the body as
+// ornamentation. iLink renders mentions only as text, never structurally.
+func normalizeBody(content string) string {
 	cleaned := mentionTrailer.ReplaceAllString(content, "")
-	return strings.TrimSpace(cleaned), mentioned
+	return strings.TrimSpace(cleaned)
 }
 
 // Post sends body to the WeChat thread identified by threadID. It splits into
@@ -391,7 +372,7 @@ func normalizeBody(content, botName string) (string, bool) {
 func (a *Adapter) Post(ctx context.Context, threadID, body string) (string, error) {
 	a.mu.Lock()
 	client := a.client
-	ref, ok := a.threads[threadID]
+	token, ok := a.threads[threadID]
 	a.mu.Unlock()
 	if client == nil {
 		return "", errors.New("wechat: not started")
@@ -412,7 +393,7 @@ func (a *Adapter) Post(ctx context.Context, threadID, body string) (string, erro
 			return firstID, ctx.Err()
 		default:
 		}
-		id, err := a.sendChunk(ctx, client, threadID, ref, ch)
+		id, err := client.SendText(ctx, threadID, ch, token)
 		if err != nil {
 			if isThreadGone(err) {
 				return firstID, adapter.ErrThreadGone
@@ -426,32 +407,6 @@ func (a *Adapter) Post(ctx context.Context, threadID, body string) (string, erro
 	return firstID, nil
 }
 
-// sendChunk delivers one chunk. DMs use the blessed SendText helper; groups use
-// the low-level SendMessage with a GroupID-addressed envelope (see the package
-// doc and the spec — the SDK does not expose a group-send helper and this path
-// is unverified against the live iLink API).
-func (a *Adapter) sendChunk(ctx context.Context, client ilinkClient, threadID string, ref threadRef, text string) (string, error) {
-	if !ref.group {
-		return client.SendText(ctx, threadID, text, ref.token)
-	}
-	clientID := newClientID()
-	req := &ilink.SendMessageReq{Msg: &ilink.WeixinMessage{
-		GroupID:      threadID,
-		ClientID:     clientID,
-		MessageType:  ilink.MsgTypeBot,
-		MessageState: ilink.StateFinish,
-		ContextToken: ref.token,
-		ItemList: []ilink.MessageItem{
-			{Type: ilink.ItemText, TextItem: &ilink.TextItem{Text: text}},
-		},
-	}}
-	if err := client.SendMessage(ctx, req); err != nil {
-		return "", err
-	}
-	// SendMessage returns no id; the client_id we minted is the correlation key.
-	return clientID, nil
-}
-
 // isThreadGone maps the SDK's "no cached token" sentinel to thread-gone
 // semantics. (We normally catch the unknown-thread case via our own cache, but
 // a token can expire between inbound and Post.)
@@ -459,21 +414,17 @@ func isThreadGone(err error) bool {
 	return errors.Is(err, ilink.ErrNoContextToken)
 }
 
-// newClientID mints a unique outbound message id used for transcript
-// correlation on group sends (which return no server id).
-func newClientID() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return fmt.Sprintf("espur-wechat:%d-%s", time.Now().UnixMilli(), hex.EncodeToString(b[:]))
-}
-
 // ---- persistence ----
 
-// loadSession reads the persisted session. A missing or unreadable file yields
-// a zero session (fresh QR login), never an error.
+// loadSession reads the persisted session via the store. A missing or
+// unreadable session yields a zero session (fresh QR login), never an error.
 func (a *Adapter) loadSession() session {
-	data, err := os.ReadFile(a.storagePath)
+	data, err := a.store.Load()
 	if err != nil {
+		logLine("wechat.session.load_failed", map[string]any{"err": err.Error()})
+		return session{}
+	}
+	if len(data) == 0 {
 		return session{}
 	}
 	var s session
@@ -484,17 +435,13 @@ func (a *Adapter) loadSession() session {
 	return s
 }
 
-// saveSession writes the session atomically (temp file + rename) at mode 0600.
+// saveSession marshals and persists the session via the store.
 func (a *Adapter) saveSession(s session) error {
 	data, err := json.Marshal(s)
 	if err != nil {
 		return err
 	}
-	tmp := a.storagePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, a.storagePath)
+	return a.store.Save(data)
 }
 
 // saveCursor persists the advancing long-poll cursor. Invoked from Monitor's

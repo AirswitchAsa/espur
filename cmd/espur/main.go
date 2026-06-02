@@ -153,21 +153,29 @@ func run() (int, error) {
 		logger.Warn("ESPUR_DISCORD_TOKEN unset — Discord adapter not started")
 	}
 
-	// WeChat (personal account via openwechat). Opt-in: spec/adapter.dog.md
-	// notes Tencent's automation policy and the QR-login UX; only start when
-	// the operator explicitly asks for it.
+	// WeChat (personal account via the iLink Bot API). Opt-in: spec/adapter.dog.md
+	// "Platform notes — WeChat" covers the reply-only/context-token semantics and
+	// the QR-image login UX; only start when the operator explicitly asks for it.
 	if strings.EqualFold(os.Getenv("ESPUR_WECHAT_ENABLED"), "1") ||
 		strings.EqualFold(os.Getenv("ESPUR_WECHAT_ENABLED"), "true") {
 		storagePath := filepath.Join(dataDir, "wechat-session.json")
-		wa, err := wechat.New(storagePath)
+		var waOpts []wechat.Option
+		if botName := strings.TrimSpace(os.Getenv("ESPUR_WECHAT_BOT_NAME")); botName != "" {
+			waOpts = append(waOpts, wechat.WithBotName(botName))
+		}
+		wa, err := wechat.New(storagePath, waOpts...)
 		if err != nil {
 			logger.Error("wechat adapter construction failed",
 				"event", obs.AdapterDisconnected, "err", err.Error())
 		} else {
-			wa.SetUUIDCallback(func(uuid string) {
+			// iLink's QR payload is a URL to encode (qrcode_img_content), not a
+			// login.weixin.qq.com URL. Render a scannable QR to stderr (stdout
+			// stays clean JSON logs) and also record the event.
+			wa.SetQRCallback(func(imgContent string) {
+				wechat.WriteLoginQR(os.Stderr, imgContent)
 				logger.Info("wechat login QR ready",
-					"event", "wechat.login.uuid",
-					"qr_url", "https://login.weixin.qq.com/qrcode/"+uuid)
+					"event", "wechat.login.qr",
+					"qr_url", imgContent)
 			})
 			core.RegisterAdapter(wa)
 			ch, err := wa.Start(adapterCtx)

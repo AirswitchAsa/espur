@@ -9,7 +9,7 @@
 | Storage | SQLite via [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) | Pure-Go driver, no CGo, one file on disk |
 | Secrets | [age](https://github.com/FiloSottile/age) for column-level encryption | Master key from env var at boot. OAuth credentials are not stored by Espur — delegated to `opencode auth login`. |
 | Agent runtime | opencode CLI (`opencode run --format json --model …`) | Stateless invocation per trigger |
-| IM adapters | One package per platform under `internal/adapter/` | Discord (gateway) + WeChat personal via [openwechat](https://github.com/eatmoreapple/openwechat) (QR-login) |
+| IM adapters | One package per platform under `internal/adapter/` | Discord (gateway) + WeChat personal via the iLink Bot API SDK [openilink-sdk-go](https://github.com/openilink/openilink-sdk-go) (HTTP/JSON long-poll, QR-image login) |
 | Testing | stdlib `testing` (+ Go fuzz) | Boring |
 | Build | `go build` + multi-stage Dockerfile | No Make heroics |
 
@@ -75,7 +75,7 @@ dog lint docs/specs
 5. ✅ **Transcript + context assembly**.
 6. ✅ **Memory seed**.
 7. ✅ **Web UI** — vendor config, thread list, OAuth status. (OAuth flows themselves are delegated to `opencode auth login`; see [`specs/oauth.dog.md`](specs/oauth.dog.md).)
-8. ✅ **WeChat adapter** — personal account via openwechat; opt-in via `ESPUR_WECHAT_ENABLED=1`.
+8. ✅ **WeChat adapter** — personal account via the iLink Bot API (`openilink-sdk-go`); reply-only DMs (+ best-effort group send); opt-in via `ESPUR_WECHAT_ENABLED=1`.
 9. ✅ **Penalty box** — exponential backoff with jitter, auth-locked permanent state.
 10. ✅ **Graceful shutdown + observability** — phase-ordered drain, JSON logs to stdout with stable `event=` names, `/healthz`.
 11. ✅ **Dockerfile + smoke** — multi-stage build (Go + Node 20 Alpine), opencode pre-installed, non-root.
@@ -83,7 +83,7 @@ dog lint docs/specs
 Not yet exercised against real infrastructure:
 
 - Real-world OAuth smoke against a live provider account.
-- Real-world WeChat smoke against an actual QR-login session.
+- Real-world WeChat smoke against an actual iLink QR-login session (incl. verifying the best-effort group-send path, which the SDK does not exercise).
 - Real-world Discord smoke against a live guild.
 - Per-thread / per-vendor "test now" affordances in the UI.
 
@@ -102,7 +102,8 @@ All configuration is via environment variables; no config file.
 | `ESPUR_OPENCODE_MAX_CONCURRENT` | `4` | Global concurrency cap on opencode children |
 | `ESPUR_SHUTDOWN_DRAIN` | `30s` (floored to `OPENCODE_TIMEOUT`) | Drain deadline after SIGTERM |
 | `ESPUR_DISCORD_TOKEN` | unset | If set, Discord adapter starts |
-| `ESPUR_WECHAT_ENABLED` | unset | If `1`, WeChat adapter starts (QR-login at first run) |
+| `ESPUR_WECHAT_ENABLED` | unset | If `1`, WeChat adapter starts (iLink QR-login at first run) |
+| `ESPUR_WECHAT_BOT_NAME` | unset | Bot display name used to detect `@`-mentions in WeChat groups. If unset, group mentions can't be detected and the bot only responds in DMs |
 | `XDG_DATA_HOME` | container: `/data/xdg-data` | Shared with `opencode auth login` so child processes see the same auth.json |
 
 See [`specs/bootstrap.dog.md`](specs/bootstrap.dog.md) for the authoritative list.

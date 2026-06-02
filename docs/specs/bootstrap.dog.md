@@ -45,7 +45,7 @@ The complete set of state that survives a restart:
 
 - `data/espur.db` (SQLite): vendor list + priority, encrypted credentials + metadata (BYO API keys), penalty-box state per vendor, message-ID dedup table per platform, any future operator-facing tables.
 - `$XDG_DATA_HOME/opencode/auth.json` (under `data/xdg-data/` by default): opencode's own auth file holding OAuth bundles. Owned and rotated by `opencode auth login` — see [[oauth]]. Espur reads it for `/oauth` display only.
-- `data/wechat-session.json` (optional, present only when [[adapter]] WeChat is enabled): openwechat hot-reload session blob so subsequent boots skip the QR-login step.
+- `data/wechat-session.json` (optional, present only when [[adapter]] WeChat is enabled): iLink session state — `bot_token`, `bot_id`, `user_id`, connected `base_url`, and the `getUpdates` long-poll cursor — so subsequent boots skip the QR-login step and resume polling where they left off.
 - `data/threads/<platform>/<encoded_id>/`: per-thread working directory containing `AGENTS.md`, any `fact_*.md` opencode wrote, the `transcript.jsonl`, and any opencode-side scratch.
 
 Everything else is process-local and recomputed at boot:

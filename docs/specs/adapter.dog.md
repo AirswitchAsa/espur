@@ -29,7 +29,7 @@ Both variants ride the same channel. Ordering inside the channel reflects the or
 **Per-adapter responsibilities.**
 
 - **Transport client.** Holds the live connection. Reconnects on transient drops with bounded exponential backoff (1s base, 60s cap, jitter). Exits the start loop on hard auth failure after emitting `AuthRevoked`.
-- **Inbound normalizer.** The only place that knows the platform's payload shape. Extracts ids/body/author, performs **mention detection** using the platform's native mechanism (Discord: bot user id in `mentions`; WeChat: configured nickname / @-token match; DMs: always true), strips the bot's mention token from `body`, renders attachments to placeholder tokens, distinguishes the bot's own outbound posts from inbound user messages (and drops the former).
+- **Inbound normalizer.** The only place that knows the platform's payload shape. Extracts ids/body/author, performs **mention detection** using the platform's native mechanism (Discord: bot user id in `mentions`; WeChat/iLink: DM-only in v0.6.0, so always true; DMs in general: always true), strips the bot's mention token from `body`, renders attachments to placeholder tokens, distinguishes the bot's own outbound posts from inbound user messages (and drops the former).
 - **Outbound poster.** Chunks `body` per the rules in [[reply]] (paragraph → sentence → word → byte; never inside a fenced code block) at the platform's documented per-message limit (Discord 2000 chars, etc.). Posts chunks sequentially. Performs bounded retry on transient send errors (3 attempts, 1s/3s/9s backoff). Honours the platform's own rate-limit headers (e.g. Discord 429 `Retry-After`) once.
 - **Webhook verification & replay defense** (webhook-style adapters only). Verify the platform's signature (HMAC, `X-*` headers, etc.) before parsing the payload. Reject unsigned requests. Reject obvious replays via the platform's nonce/timestamp window if one exists; otherwise rely on core dedup as the second line of defense.
 - **Lifecycle emitter.** Pushes `LifecycleEvent` records onto the same channel as `MessageEvent`. Required events: `Connected` on first successful handshake; `Reconnecting` per attempt; `Disconnected` with cause on drop / downstream backpressure; `AuthRevoked` (terminal) on hard auth failure.
@@ -80,6 +80,35 @@ Both variants ride the same channel. Ordering inside the channel reflects the or
 - Core logs cover dedup, queueing, invocation, vendor-pool transitions, transcript writes.
 - Request IDs from [[reply]] appear in both adapter and core logs whenever the failure was bot-side; this is the join key for operator triage.
 - Message bodies are never logged. Author labels and message ids are.
+
+### Adapter: WeChat (iLink Bot API)
+
+The WeChat adapter (`internal/adapter/wechat/`) talks to Tencent's **personal-account iLink Bot API** (`https://ilinkai.weixin.qq.com`) via the Go SDK [`github.com/openilink/openilink-sdk-go`](https://github.com/openilink/openilink-sdk-go) (MIT, pinned at v0.6.0). It replaces the earlier Web/Desktop WeChat protocol (`openwechat`), which Tencent actively bans. iLink is the officially sanctioned personal-bot transport, so it is the lower-ban-risk path — but it is still **personal / non-commercial** and opt-in (`ESPUR_WECHAT_ENABLED=1`).
+
+**Transport — pure HTTP/JSON, no gateway socket.**
+
+- **Login.** QR-code scan → `bot_token`. The SDK's `LoginWithQR` fetches a QR and surfaces it through an `OnQRCode(imgContent)` callback. The payload is the **QR image content** (`qrcode_img_content`), *not* a `login.weixin.qq.com/qrcode/<uuid>` URL as in the old protocol. The operator scans it from the WeChat mobile client; the SDK polls scan status (`wait`/`scaned`/`confirmed`/`expired`) until connected, then returns `{Connected, BotToken, BotID, UserID, BaseURL}`.
+- **Inbound.** Long-poll (`getUpdates`). The SDK's `Monitor(ctx, handler, opts)` runs the poll loop, auto-retry/backoff, and a server-driven dynamic timeout. Each `WeixinMessage` carries `FromUserID`, optional `GroupID`, `ContextToken`, `MessageType` (user vs. bot), and an `ItemList` of typed content items. `ilink.ExtractText` collapses text + quoted-reply + voice-transcription items into a single body string.
+- **Outbound.** Reply-only. `SendText(ctx, toUserID, text, contextToken)` for DMs; low-level `SendMessage` with a `GroupID`-addressed envelope for groups (see below). The SDK has no persistent socket — `Post` is a single HTTP round-trip per chunk.
+
+**Context-token threading (the key constraint).** Every iLink reply must echo the `context_token` observed on the *inbound* message it answers. But `Adapter.Post(ctx, threadID, body)` carries no token. Resolution: the adapter caches, per `ThreadID`, the latest `context_token` seen inbound (along with whether that thread is a group). `Post` looks the token up and threads it into the send call. The SDK also keeps its own per-`FromUserID` token cache for `Push`, but the adapter keeps an authoritative cache of its own so DM **and** group threads are handled uniformly and the behaviour is testable without the live API.
+
+**Reply-only (no cold open).** Like a Telegram bot, the adapter cannot initiate a conversation with a user/group that has never messaged it — without a cached `context_token` there is nothing to echo. If `Post` is called for a `ThreadID` with no cached token, it returns `ErrThreadGone`; the core handles that as a downgraded crash outcome (not an Espur bug).
+
+**ThreadID mapping.**
+
+- **DM:** `ThreadID == FromUserID` (the peer's iLink user id). `Mention` is always `true` (implicit DM mention).
+- **Group:** `ThreadID == GroupID`. The whole group is one thread; replies go to the group. `Author{ID,Label}` is the individual sender. `Mention` is `true` only when the bot is at-mentioned.
+
+**Group support — best-effort, unverified against the live API.** v0.6.0 *surfaces* inbound group messages (`GroupID` populated) but exposes **no** group-send helper: `SendText`/`Push` only address an individual `ToUserID`, and the SDK's own token cache keys on `FromUserID`. The shared `WeixinMessage` envelope that the `sendmessage` endpoint accepts *does* carry a `group_id` field, so the adapter replies to groups by hand-building a `SendMessage` request with `GroupID` set and the inbound `context_token` echoed. This path is the protocol's apparent intent but is **not exercised by the SDK helpers and has not been verified against a live iLink account**; it is marked as such in code and may need adjustment once smoke-tested. DMs use the blessed `SendText` helper and are the verified path.
+
+**Group at-mention detection.** iLink does not surface mentions structurally — only as text. Detection matches an `@`-prefixed token against the bot's configured display name, supplied via `ESPUR_WECHAT_BOT_NAME` (the SDK login result does not include a nickname). **If the bot name is unset, group at-mentions cannot be detected and the bot will not auto-respond in groups** (DMs are unaffected). This is logged and documented rather than silently reducing scope.
+
+**Self-echo and bot identity.** A QR login provisions a **new bot** (its own `BotID`, an `im.bot`-suffixed id) that the scanning account *owns*; the login `UserID` is that human operator (an `im.wechat`-suffixed id), **not** the bot. `Monitor` may redeliver the bot's own outbound messages; they arrive with `MessageType == MsgTypeBot`, so the normalizer drops any non-user message and replies never loop. It deliberately does **not** filter on `UserID` — that would drop the operator's own legitimate messages to their bot.
+
+**Persistence.** Replaces the old `openwechat` hot-reload blob. The adapter persists `bot_token`, `bot_id`, `user_id`, the connected `base_url`, and the `getUpdates` cursor (`buf`) to `data/wechat-session.json` (mode 0600, atomic write). On boot: if a saved `bot_token` exists, the QR step is skipped, the saved `base_url` is restored, and `Monitor` resumes from `InitialBuf = <saved cursor>`; `OnBufUpdate` persists the cursor as it advances.
+
+**Lifecycle.** `Connected` after a successful login/resume. `AuthRevoked` when the server reports session expiry (`errcode -14`, surfaced via `OnSessionExpired`); on that event the adapter wipes the persisted token so the next boot forces a fresh QR scan. `Disconnected` on an unexpected `Monitor` exit. There is no gateway heartbeat, so `Healthy()` reflects the login/poll state rather than a socket.
 
 ## Outcome
 

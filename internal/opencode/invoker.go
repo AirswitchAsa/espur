@@ -25,22 +25,22 @@ const DefaultTimeout = 120 * time.Second
 // Spec: opencode-invoke.dog.md "Notes" — grace period pinned to 5 seconds.
 const DefaultKillGrace = 5 * time.Second
 
-// DefaultExportTimeout caps `opencode export` independently of the run
-// timeout. Export is a local DB read — sub-second in practice — so a tight
-// budget is fine and prevents long-tail run completions from starving export.
-// It bounds the whole retry sequence below, not a single attempt.
+// DefaultExportTimeout caps a single `opencode export` invocation. The export
+// itself is a sub-second DB read; this only guards against a hung process.
 const DefaultExportTimeout = 30 * time.Second
 
-// Export retry tuning. `opencode export` is only a fallback now (assistant text
-// normally comes straight from run stdout), but when used it occasionally
-// returns nothing in the instant after `opencode run` exits — the just-written
-// session hasn't settled in opencode's SQLite store yet, and that window grows
-// with session size. Retry with escalating backoff (≈6s total over 5 attempts)
-// so a slow-settling large session still resolves instead of crashing. The
-// whole sequence stays bounded by DefaultExportTimeout.
+// Export retry tuning. After a run, a fresh `opencode export` returns empty (and
+// errors with "unexpected end of JSON input") for several seconds while the
+// just-written session becomes visible in opencode's SQLite store — no external
+// process holds the db, it's an internal visibility delay, and it grows with
+// session size (observed 4–7s on large research turns). So retry export with
+// capped exponential backoff until exportRetryBudget elapses, then give up. The
+// budget is a var (not const) so tests can shrink it.
+var exportRetryBudget = 45 * time.Second
+
 const (
-	exportMaxAttempts  = 5
-	exportRetryBackoff = 400 * time.Millisecond
+	exportBackoffMin = 300 * time.Millisecond
+	exportBackoffMax = 2 * time.Second
 )
 
 // Outcome enumerates the terminal categories defined in
@@ -375,40 +375,47 @@ func assistantTextFromStdout(stdout string) string {
 }
 
 // exportAssistantTextRetry pulls the assistant text from the session export,
-// retrying on failure or empty output. `opencode export` is a read-only,
-// idempotent DB read, but run in the instant after `opencode run` exits it
-// occasionally crashes or returns nothing: the just-written session hasn't
-// fully settled in opencode's SQLite store yet (observed against opencode
-// 1.15.13 — a heavy research turn produced a full answer, yet the immediate
-// export failed while exporting the same session a moment later succeeded).
-// A short backoff between attempts converts that transient into a delivered
-// reply rather than an export_failed crash.
+// retrying while export errors (it is a read-only, idempotent DB read). Run in
+// the instant after `opencode run` exits, export crashes with empty output for
+// several seconds: the just-written session hasn't become visible in opencode's
+// SQLite store yet, and that window grows with session size (observed 4–7s on
+// large research turns against opencode 1.15.13). Retrying with capped backoff
+// until exportRetryBudget elapses converts that into a delivered reply rather
+// than an export_failed crash.
 //
-// The whole sequence is bounded by DefaultExportTimeout (attempts share one
-// budget, so worst-case latency matches the old single-shot path). The last
-// attempt's (text, err) is returned verbatim so the caller still distinguishes
-// export_failed (err != nil) from no_assistant_text (empty text, no err).
+// It retries only on error — a successful export with empty assistant text is a
+// definitive "no answer", not a settle transient, so it returns immediately.
+// The last attempt's (text, err) is returned verbatim so the caller still
+// distinguishes export_failed (err != nil) from no_assistant_text (no err).
 func exportAssistantTextRetry(parent context.Context, bin, sessionID string, creds map[string]string) (string, error) {
-	ctx, cancel := context.WithTimeout(parent, DefaultExportTimeout)
+	ctx, cancel := context.WithTimeout(parent, exportRetryBudget)
 	defer cancel()
 	var (
-		text string
-		err  error
+		text    string
+		err     error
+		backoff = exportBackoffMin
 	)
-	for attempt := 0; attempt < exportMaxAttempts; attempt++ {
+	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return text, err // out of budget — surface the last attempt's result
-			case <-time.After(time.Duration(attempt) * exportRetryBackoff):
+				return text, err // budget exhausted — surface the last failure
+			case <-time.After(backoff):
+			}
+			if backoff *= 2; backoff > exportBackoffMax {
+				backoff = exportBackoffMax
 			}
 		}
-		text, err = exportAssistantText(ctx, bin, sessionID, creds)
-		if err == nil && strings.TrimSpace(text) != "" {
-			return text, nil
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, DefaultExportTimeout)
+		text, err = exportAssistantText(attemptCtx, bin, sessionID, creds)
+		attemptCancel()
+		if err == nil {
+			return text, nil // authoritative read (even if empty) — don't retry
+		}
+		if ctx.Err() != nil {
+			return text, err
 		}
 	}
-	return text, err
 }
 
 func exportAssistantText(ctx context.Context, bin, sessionID string, creds map[string]string) (string, error) {

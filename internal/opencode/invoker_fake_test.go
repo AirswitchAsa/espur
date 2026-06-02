@@ -111,6 +111,16 @@ func fakeCredEnv(kv map[string]string) map[string]string {
 	return out
 }
 
+// shortExportBudget shrinks the export retry budget for tests that exhaust it
+// (export never succeeds), so they finish in well under a second instead of the
+// production budget. Restored after the test.
+func shortExportBudget(t *testing.T) {
+	t.Helper()
+	old := exportRetryBudget
+	exportRetryBudget = 700 * time.Millisecond
+	t.Cleanup(func() { exportRetryBudget = old })
+}
+
 // --- tests ---
 
 func TestInvoke_Fake_Success(t *testing.T) {
@@ -162,6 +172,7 @@ func TestInvoke_Fake_StdoutFallbackWhenExportUnavailable(t *testing.T) {
 	// Export never returns usable JSON (every attempt empty → unmarshal fails);
 	// stdout carried the answer. After exhausting export retries we fall back to
 	// stdout rather than dropping a turn that did produce an answer.
+	shortExportBudget(t)
 	res, err := Invoke(context.Background(), Request{
 		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
 			"FAKE_OC_STDOUT": `{"type":"step_start","sessionID":"ses_fb"}` + "\n" +
@@ -239,6 +250,7 @@ func TestInvoke_Fake_NoAssistantText(t *testing.T) {
 }
 
 func TestInvoke_Fake_ExportFails(t *testing.T) {
+	shortExportBudget(t)
 	res, _ := Invoke(context.Background(), Request{
 		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
 			"FAKE_OC_STDOUT": `{"type":"step_start","sessionID":"ses_x"}` + "\n",
@@ -254,8 +266,8 @@ func TestInvoke_Fake_ExportFails(t *testing.T) {
 }
 
 func TestInvoke_Fake_ExportRetrySucceeds(t *testing.T) {
-	// First 2 export attempts fail (transient); the 3rd succeeds. With
-	// exportMaxAttempts=3 the wrapper should recover and deliver the text.
+	// First 2 export attempts fail (transient); the 3rd succeeds. The retry loop
+	// should keep going within its budget and deliver the recovered text.
 	counter := filepath.Join(t.TempDir(), "export-attempts")
 	res, err := Invoke(context.Background(), Request{
 		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
@@ -277,7 +289,9 @@ func TestInvoke_Fake_ExportRetrySucceeds(t *testing.T) {
 }
 
 func TestInvoke_Fake_ExportRetryExhausted(t *testing.T) {
-	// Every attempt fails (FAIL_TIMES exceeds exportMaxAttempts) → export_failed.
+	// Every export attempt fails; stdout has no text either → export_failed once
+	// the budget is exhausted.
+	shortExportBudget(t)
 	counter := filepath.Join(t.TempDir(), "export-attempts")
 	res, _ := Invoke(context.Background(), Request{
 		Vendor: Vendor{Model: "m", CredEnv: fakeCredEnv(map[string]string{
@@ -293,12 +307,12 @@ func TestInvoke_Fake_ExportRetryExhausted(t *testing.T) {
 	if res.Outcome != OutcomeCrash || res.CrashReason != "export_failed" {
 		t.Fatalf("outcome=%s reason=%s", res.Outcome, res.CrashReason)
 	}
-	// Confirm it actually retried the full budget rather than giving up early.
+	// Confirm it actually retried (more than one attempt) before giving up.
 	if b, err := os.ReadFile(counter); err == nil {
 		var n int
 		_, _ = fmt.Sscanf(string(b), "%d", &n)
-		if n != exportMaxAttempts {
-			t.Fatalf("expected %d export attempts, got %d", exportMaxAttempts, n)
+		if n < 2 {
+			t.Fatalf("expected the export to be retried, got %d attempt(s)", n)
 		}
 	} else {
 		t.Fatalf("counter file unreadable: %v", err)

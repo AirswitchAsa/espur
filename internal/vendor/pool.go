@@ -151,7 +151,10 @@ type PenalizedSnapshot struct {
 // exhausted, or a non-fallthrough outcome (timeout / crash) ends the loop.
 // userMsg is the composite message from internal/context (already wrapped).
 // workDir is the per-thread working directory.
-func (p *Pool) Run(ctx context.Context, workDir, userMsg string, timeout time.Duration) (Result, error) {
+// stream, when non-nil, receives each completed assistant message (with the
+// vendor that produced it) as the run streams, for progressive posting. See
+// [[reply]]: the reply unit is one platform message per assistant message.
+func (p *Pool) Run(ctx context.Context, workDir, userMsg string, timeout time.Duration, stream func(vendorID, text string)) (Result, error) {
 	// Global concurrency cap. Acquire before any vendor walking — once we
 	// hold a slot, the rest of this call is allowed to spawn at most one
 	// opencode child at a time (the per-attempt switch inside the loop is
@@ -211,6 +214,10 @@ func (p *Pool) Run(ctx context.Context, workDir, userMsg string, timeout time.Du
 			UserMsg: userMsg,
 			Timeout: timeout,
 		}
+		if stream != nil {
+			vendorID := v.VendorID
+			ocReq.OnMessage = func(text string) { stream(vendorID, text) }
+		}
 		ocRes, ocErr := p.invoker.Invoke(ctx, ocReq)
 		att := Attempt{VendorID: v.VendorID, Outcome: ocRes.Outcome, CrashReason: ocRes.CrashReason}
 
@@ -243,6 +250,19 @@ func (p *Pool) Run(ctx context.Context, workDir, userMsg string, timeout time.Du
 			class := Classify(ocRes.Stdout, ocRes.Stderr)
 			att.Class = class
 			res.Attempts = append(res.Attempts, att)
+			if ocRes.Streamed {
+				// This vendor already posted assistant messages to the user
+				// before failing. Re-running on another vendor would replay a
+				// second full turn over the top of the first, so we cannot fall
+				// through — terminate as a crash and let the caller post the
+				// error note after the partial output. (Vendor fallthrough is
+				// for failures that surface before any output, the common case:
+				// auth / rate-limit / 5xx on the first request.)
+				res.Outcome = OutcomeCrash
+				res.VendorID = v.VendorID
+				res.CrashReason = ocRes.CrashReason
+				return res, ocErr
+			}
 			if class == ClassNone {
 				// Genuine crash — propagate.
 				res.Outcome = OutcomeCrash

@@ -47,7 +47,7 @@ func TestRun_SuccessFirstVendor(t *testing.T) {
 		VendorID: "v1", Model: "m1", Enabled: true, Position: 0, CredKind: "byo_key",
 	})
 
-	res, err := p.Run(ctx, t.TempDir(), "<request>hi</request>", 30*time.Second)
+	res, err := p.Run(ctx, t.TempDir(), "<request>hi</request>", 30*time.Second, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestRun_FallthroughOnRateLimit(t *testing.T) {
 	_ = db.UpsertVendor(ctx, store.Vendor{VendorID: "v1", Model: "m1", Enabled: true, Position: 0})
 	_ = db.UpsertVendor(ctx, store.Vendor{VendorID: "v2", Model: "m2", Enabled: true, Position: 1})
 
-	res, err := p.Run(ctx, t.TempDir(), "x", 30*time.Second)
+	res, err := p.Run(ctx, t.TempDir(), "x", 30*time.Second, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestRun_AuthLocksVendor(t *testing.T) {
 	_ = db.UpsertVendor(ctx, store.Vendor{VendorID: "v1", Model: "m1", Enabled: true, Position: 0})
 	_ = db.UpsertVendor(ctx, store.Vendor{VendorID: "v2", Model: "m2", Enabled: true, Position: 1})
 
-	res, _ := p.Run(ctx, t.TempDir(), "x", 30*time.Second)
+	res, _ := p.Run(ctx, t.TempDir(), "x", 30*time.Second, nil)
 	if res.Outcome != OutcomeSuccess || res.VendorID != "v2" {
 		t.Fatalf("expected fallthrough to v2: %+v", res)
 	}
@@ -110,7 +110,7 @@ func TestRun_TimeoutDoesNotPenalize(t *testing.T) {
 	_ = db.UpsertVendor(ctx, store.Vendor{VendorID: "v1", Model: "m1", Enabled: true, Position: 0})
 	_ = db.UpsertVendor(ctx, store.Vendor{VendorID: "v2", Model: "m2", Enabled: true, Position: 1})
 
-	res, _ := p.Run(ctx, t.TempDir(), "x", 30*time.Second)
+	res, _ := p.Run(ctx, t.TempDir(), "x", 30*time.Second, nil)
 	if res.Outcome != OutcomeTimeout || res.VendorID != "v1" {
 		t.Fatalf("expected timeout on v1, got %+v", res)
 	}
@@ -130,7 +130,7 @@ func TestRun_AllDrained_NothingEligible(t *testing.T) {
 	until := time.Now().Add(time.Hour)
 	_ = db.PutPenalty(ctx, store.Penalty{VendorID: "v1", Status: store.PenaltyCooldown, FailureStreak: 3, CooldownUntil: &until})
 
-	res, _ := p.Run(ctx, t.TempDir(), "x", 30*time.Second)
+	res, _ := p.Run(ctx, t.TempDir(), "x", 30*time.Second, nil)
 	if res.Outcome != OutcomeAllDrained {
 		t.Fatalf("expected drained, got %+v", res)
 	}

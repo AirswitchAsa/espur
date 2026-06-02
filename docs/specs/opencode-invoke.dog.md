@@ -38,14 +38,25 @@ opencode run --format json --model <vendor-model-id>
 - On timeout, the child is killed (`SIGTERM` then `SIGKILL` after a grace period of a few seconds), the attempt is recorded as a timeout, and the timeout reply behavior takes over (see [[reply]]).
 - A timeout is **not** counted as a vendor failure — it does not put the vendor in the penalty box and does not cause fallthrough to the next vendor.
 
-**Output parsing**
+**Output parsing — streamed, with an export backstop**
 
-- Stdout is treated as opencode's NDJSON event stream. Espur reads the `sessionID` field from the first emitted event (typically `step_start`).
-- After the child exits, Espur runs `opencode export <sessionID>` and reads the **assistant message's `text`-type parts** from the returned session record. Their concatenation is the assistant reply.
-- Rationale: as of opencode 1.15.11, the NDJSON stdout stream intermittently omits trailing `type=text` events even when the session itself contains the assistant text. The session export is the authoritative source.
+Stdout is opencode's NDJSON event stream, read **line-by-line as the child writes it** (not buffered until exit). Espur reconstructs assistant messages from the events and emits each one the moment it completes, so [[reply]] can post it while the run is still going:
+
+- `step_start` announces a new assistant message (a new `messageID`); `sessionID` is read from the first event that carries it.
+- `type=text` events carry the message's text parts. A part streams as repeated events for the same part id (growing text), so text is keyed by part id with last-value-wins and concatenated in first-seen order.
+- `step_finish` is the per-message boundary: when it arrives for a message that accumulated non-empty text, that message is emitted. Tool-only and empty messages emit nothing (they are working state, not a reply).
+
+After the child exits, Espur runs `opencode export <sessionID>` **only as a backstop**, to recover a final message whose trailing `type=text` event opencode dropped from stdout (observed intermittently, opencode 1.15.11–1.15.13). The backstop is consulted only when stdout left a gap — no message streamed at all, or the last `messageID` stdout announced never received its text. Crucially:
+
+- The export retry is keyed on that **final messageID**: it waits until the export actually contains that message, rather than accepting the first non-empty read. A fresh `opencode export` right after a run can return a *mid-turn snapshot* — the session is visible but its final message hasn't been written yet (an internal SQLite-visibility delay that grows with session size, observed 4–7s on large turns). Accepting that snapshot would serve an earlier preamble as the answer. Waiting for the announced final messageID prevents that.
+- Recovered messages stdout didn't already deliver are emitted in order, after the streamed ones, so the answer arrives last.
+
+Other rules:
+
 - Stderr is captured for diagnostics and used to classify failures (rate limit, quota, 5xx) per [[vendor-pool]].
 - A non-zero exit code with no recoverable session is treated as a crash; see [[reply]] for the user-facing message.
-- A zero exit code with no usable assistant text in the exported session is also a crash (same path).
+- A zero exit code that yields no usable assistant text from either source is also a crash (`no_assistant_text`); a hard export failure when the stream produced nothing is `export_failed`.
+- Once a vendor attempt has streamed ≥1 assistant message, a later failure can **not** fall through to another vendor — re-running would replay a second turn over the posted output. Fallthrough applies only to failures that surface before any output (the common auth / rate-limit / 5xx case). See [[vendor-pool]].
 
 **Vendor fallthrough**
 

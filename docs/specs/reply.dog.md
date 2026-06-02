@@ -6,15 +6,17 @@ A trigger has reached a terminal outcome from the invocation phase: success, tim
 
 ## Description
 
-**Batch only, never streaming.** Espur posts the full reply text in a single platform message once the invocation phase ends. There is no token streaming, no progressive edits to a placeholder message, no partial flushes. This keeps adapters cross-platform-identical.
+**One platform message per assistant message; never token streaming.** A single trigger can produce several assistant messages — opencode emits a message per step (a preamble, then tool calls, then the answer). Espur posts each assistant message as its own platform message the moment opencode finishes it, in order, so the user sees progress while the agent works. The *unit* of delivery is one whole assistant message: there is still no token streaming, no progressive edits to a placeholder, no partial flushes within a message. Adapters stay cross-platform-identical — they receive ordinary sequential `Post(text)` calls and never learn that a turn produced more than one.
 
-If the platform has a per-message length limit (Discord 2000 chars, etc.), the adapter is responsible for splitting the single logical reply into the minimum number of chunks needed, posted sequentially in order. From Espur's core's perspective, this is still "one reply" per trigger.
+How the messages are obtained is [[opencode-invoke]]'s job: each is delivered as it completes from the run's event stream, with a session-export backstop for a final message whose trailing text event opencode dropped.
+
+If the platform has a per-message length limit (Discord 2000 chars, etc.), the adapter is responsible for splitting each posted message into the minimum number of chunks needed, posted sequentially in order.
 
 **Success reply**
 
-- Body: the assistant text returned by opencode, verbatim, with no Espur-added prefix, suffix, or signature.
+- Body: each assistant message opencode produced, verbatim, with no Espur-added prefix, suffix, or signature, posted in order as opencode completes them.
 - Posted to the thread the trigger came from, attributed to the bot user.
-- Transcript: the reply text is appended to the thread's transcript with the bot's author label and the wall-clock time of posting.
+- Transcript: each posted message is appended to the thread's transcript as its own bot record, with the bot's author label and the wall-clock time of posting, so the next turn sees the full sequence via [[context-assembly]].
 
 **Timeout reply**
 
@@ -62,18 +64,18 @@ If the platform has a per-message length limit (Discord 2000 chars, etc.), the a
 
 ## Outcome
 
-For every trigger that reaches a terminal invocation outcome, exactly one reply is posted to the originating thread:
+For every trigger that reaches a terminal invocation outcome, the originating thread receives:
 
-| Outcome      | Reply                                                              |
-| ------------ | ------------------------------------------------------------------ |
-| Success      | opencode's assistant text, verbatim, no decoration                 |
-| Timeout      | Plain timeout message, no retry, no request ID                     |
-| All-drained  | Drained message naming penalized vendors + dashboard URL           |
-| Crash        | Error message with a request ID matching a log entry               |
+| Outcome      | Reply                                                                       |
+| ------------ | --------------------------------------------------------------------------- |
+| Success      | opencode's assistant messages, verbatim, no decoration — one post each, in order |
+| Timeout      | Plain timeout message, no retry, no request ID                              |
+| All-drained  | Drained message naming penalized vendors + dashboard URL                    |
+| Crash        | Error message with a request ID matching a log entry                        |
 
-The thread's transcript is appended with the reply text and the appropriate author label so future invocations see it via [[context-assembly]].
+The thread's transcript is appended with each posted message and the appropriate author label so future invocations see it via [[context-assembly]].
 
-A trigger never produces zero replies and never produces more than one (the coalesce ack is owned by [[trigger]], not Reply).
+A successful trigger posts one or more messages (one per assistant message). The non-success outcomes (timeout / drained / crash) post their single canned line; if assistant messages were already streamed before the failure, that line follows them. The coalesce ack is owned by [[trigger]], not Reply.
 
 ## Notes
 

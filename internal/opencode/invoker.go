@@ -89,14 +89,27 @@ type Request struct {
 	UserMsg string // composite user message from context assembly.
 	Timeout time.Duration
 	BinPath string // opencode binary; "" → look up "opencode" in PATH.
+
+	// OnMessage, if non-nil, is invoked once per completed assistant text
+	// message as the run streams, in first-seen order. This is how progressive
+	// "post each message as the agent produces it" delivery works: each call is
+	// one finished opencode assistant message (its text parts concatenated). The
+	// final message is also delivered this way — either live (its step_finish
+	// arrived on stdout) or, if opencode dropped the trailing text event, via the
+	// post-run export backstop. Callbacks run synchronously on the stdout-reader
+	// goroutine during the run and on the caller's goroutine during the backstop;
+	// they never overlap, so the callback need not be reentrant.
+	OnMessage func(text string)
 }
 
 // Result is the terminal outcome of one invocation attempt.
 type Result struct {
 	Outcome       Outcome
-	AssistantText string // populated on Success.
-	Stderr        string // captured for diagnostics / failure classification.
-	Stdout        string // raw NDJSON; kept for diagnostics.
+	AssistantText string   // populated on Success: the final assistant message.
+	Messages      []string // populated on Success: every assistant message, in order.
+	Streamed      bool     // true if ≥1 message was delivered via Request.OnMessage.
+	Stderr        string   // captured for diagnostics / failure classification.
+	Stdout        string   // raw NDJSON; kept for diagnostics.
 	ExitCode      int
 	Duration      time.Duration
 	// CrashReason is a short tag explaining a Crash outcome
@@ -128,9 +141,16 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 	// Spec: "minimal env — PATH, HOME, TMPDIR, and the vendor's credentials".
 	cmd.Env = buildEnv(req.Vendor.CredEnv)
 
-	// No TTY: pipes only, satisfying "must inherit no TTY".
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	// Stream stdout: we read opencode's NDJSON line-by-line as it arrives so each
+	// assistant message can be posted the moment it completes, rather than after
+	// the whole run. Stderr is small and only consulted post-mortem for failure
+	// classification, so it stays a plain buffer. No TTY: pipes only.
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return Result{Outcome: OutcomeCrash, CrashReason: "spawn_error"},
+			fmt.Errorf("opencode: stdout pipe: %w", err)
+	}
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	// Own process group so SIGTERM/SIGKILL reach opencode's child processes too.
@@ -145,14 +165,26 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 		}, fmt.Errorf("opencode: spawn: %w", err)
 	}
 
+	// Drain + parse stdout on its own goroutine. The parser accumulates the raw
+	// bytes (for diagnostics / Classify) and emits each completed assistant
+	// message via req.OnMessage. We must read the pipe to completion before
+	// inspecting parser state, hence scanDone.
+	sp := newStreamParser(req.OnMessage)
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		sc := bufio.NewScanner(stdoutPipe)
+		sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+		for sc.Scan() {
+			sp.feed(sc.Bytes())
+		}
+	}()
+
 	// Wait in a goroutine so we can race against runCtx.Done().
 	waitErr := make(chan error, 1)
 	go func() { waitErr <- cmd.Wait() }()
 
-	var (
-		err      error
-		timedOut bool
-	)
+	var timedOut bool
 	select {
 	case err = <-waitErr:
 	case <-runCtx.Done():
@@ -166,11 +198,14 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 			err = <-waitErr
 		}
 	}
+	<-scanDone // all stdout drained & parsed; parser state is now safe to read.
 
 	res := Result{
-		Stdout:   stdout.String(),
+		Stdout:   sp.rawStdout(),
 		Stderr:   stderr.String(),
 		Duration: time.Since(start),
+		Messages: sp.messages(),
+		Streamed: sp.count() > 0,
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		res.ExitCode = exitErr.ExitCode()
@@ -183,38 +218,56 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 
 	if timedOut {
 		// Spec: "A timeout is not counted as a vendor failure". Just report it.
+		// Any messages already streamed stand; the caller posts the timeout note.
 		res.Outcome = OutcomeTimeout
 		return res, nil
 	}
 
-	sessionID, parseErr := extractSessionID(strings.NewReader(res.Stdout))
-	if parseErr != nil {
+	if sp.sessionID == "" {
 		res.Outcome = OutcomeCrash
 		res.CrashReason = "no_parseable_json"
 		return res, nil
 	}
 
-	// The session export is the authoritative source for the assistant answer:
-	// it always holds the final message, including when opencode drops the
-	// trailing text event from the run's stdout. Trusting stdout alone is unsafe
-	// — when that trailing event is dropped, an earlier text part (e.g. the
-	// model's "let me look into it" preamble) survives and would be served as if
-	// it were the answer. Export can come back empty for a beat right after the
-	// run while the freshly-written session settles in opencode's store, so it
-	// retries (see exportAssistantTextRetry). Only if export can't be retrieved
-	// at all do we fall back to whatever text the run streamed to stdout — better
-	// a possibly-partial reply than dropping a turn that did produce an answer.
+	// Flush the final message from stdout. opencode often exits right after the
+	// last message's text without emitting its closing step_finish, so that text
+	// is in the parser but not yet delivered. The process exited cleanly (not a
+	// timeout — handled above), so the accumulated text is complete: emit it
+	// live and skip the export round-trip. Only a genuinely dropped final text
+	// event leaves nothing to flush, falling through to the backstop.
+	sp.flushFinal()
+
+	// Export backstop. The stdout stream is the primary source: each assistant
+	// message is emitted as its step_finish arrives. But opencode intermittently
+	// drops the trailing type=text event, so the final message's text can be
+	// missing from stdout even though the run produced it. The session export
+	// holds it — once the freshly-written session settles in opencode's store.
 	//
-	// Derive export's context from the caller's, not runCtx: if `opencode run`
-	// finished right at the deadline, runCtx may already be canceled, and
-	// exec.CommandContext would kill `opencode export` before it prints anything.
-	text, exportErr := exportAssistantTextRetry(ctx, bin, sessionID, req.Vendor.CredEnv)
-	if strings.TrimSpace(text) == "" {
-		if stdoutText := assistantTextFromStdout(res.Stdout); strings.TrimSpace(stdoutText) != "" {
-			text = stdoutText
+	// We only export when stdout left a gap: either no message streamed at all,
+	// or the final message (the last messageID stdout announced via step_start)
+	// never got its text. The retry is keyed on that final messageID — we wait
+	// until the export actually contains it, instead of accepting the first
+	// non-empty read. That precision is what stops a stale mid-turn snapshot from
+	// serving an earlier preamble as the answer.
+	//
+	// Export's context is the caller's, not runCtx: if `opencode run` finished
+	// right at the deadline, runCtx may already be canceled and exec would kill
+	// `opencode export` before it prints anything.
+	var exportErr error
+	if sp.count() == 0 || !sp.emittedFinal() {
+		var msgs []exportMsg
+		msgs, exportErr = exportAssistantMessagesRetry(ctx, bin, sp.sessionID, sp.finalMessageID(), req.Vendor.CredEnv)
+		if exportErr == nil {
+			for _, em := range msgs {
+				// Emit only messages stdout didn't already deliver, preserving
+				// order; the recovered tail goes out after the streamed prefix.
+				sp.emitExternal(em.ID, em.Text)
+			}
 		}
 	}
-	if strings.TrimSpace(text) == "" {
+
+	texts := sp.messages()
+	if len(texts) == 0 {
 		// Nothing from either source. Distinguish a hard export failure from a
 		// run that simply produced no assistant text (spec: "A zero exit code
 		// with no usable assistant text is also a crash").
@@ -227,8 +280,10 @@ func Invoke(ctx context.Context, req Request) (Result, error) {
 		res.CrashReason = "no_assistant_text"
 		return res, nil
 	}
+	res.Messages = texts
+	res.Streamed = sp.count() > 0
+	res.AssistantText = texts[len(texts)-1]
 	res.Outcome = OutcomeSuccess
-	res.AssistantText = text
 	return res, nil
 }
 
@@ -299,10 +354,12 @@ func extractSessionID(r io.Reader) (string, error) {
 }
 
 // ocExport mirrors the JSON shape returned by `opencode export <sessionID>`.
-// We only care about assistant message text parts here.
+// We care about assistant messages: their id (to match the run's messageID),
+// their text parts, and whether they carry a tool call (a settle signal).
 type ocExport struct {
 	Messages []struct {
 		Info struct {
+			ID   string `json:"id"`
 			Role string `json:"role"`
 		} `json:"info"`
 		Parts []struct {
@@ -312,11 +369,53 @@ type ocExport struct {
 	} `json:"messages"`
 }
 
-// stdoutTextEvent mirrors the {"type":"text",...,"part":{...}} events
-// `opencode run --format json` writes for assistant text parts.
-type stdoutTextEvent struct {
-	Type string `json:"type"`
-	Part struct {
+// exportMsg is one assistant message distilled from the session export.
+type exportMsg struct {
+	ID      string
+	Text    string
+	HasTool bool
+}
+
+// streamParser consumes `opencode run --format json` NDJSON line-by-line as the
+// child writes it, reconstructs each assistant message, and emits it via
+// onMessage the moment it completes (its step_finish event). opencode emits one
+// "message" per step (a model call); a message that calls a tool ends its step
+// and the model continues in a new message, so step_finish is a reliable
+// per-message boundary.
+//
+// Text parts stream as repeated events for the same part id (growing text), so
+// text is keyed by part id with last-value-wins and concatenated in first-seen
+// order — the same reconstruction the export uses. Tool-only and empty messages
+// produce no emit.
+type streamParser struct {
+	onMessage func(string)
+
+	raw       bytes.Buffer                 // verbatim stdout, for diagnostics/Classify
+	sessionID string                       // first sessionID seen
+	lastMsgID string                       // most recent messageID announced (step_start/text)
+	text      map[string]map[string]string // messageID -> partID -> text
+	partOrder map[string][]string          // messageID -> partID first-seen order
+	emitted   map[string]bool              // messageID -> already emitted
+	order     []string                     // emitted messages, in emit order
+	byID      map[string]string            // messageID -> emitted text
+	extSeq    int                          // synthesizes keys for id-less backstop messages
+}
+
+func newStreamParser(onMessage func(string)) *streamParser {
+	return &streamParser{
+		onMessage: onMessage,
+		text:      map[string]map[string]string{},
+		partOrder: map[string][]string{},
+		emitted:   map[string]bool{},
+		byID:      map[string]string{},
+	}
+}
+
+// streamEvent is the slice of an NDJSON run event the parser reads.
+type streamEvent struct {
+	Type      string `json:"type"`
+	SessionID string `json:"sessionID"`
+	Part      struct {
 		ID        string `json:"id"`
 		MessageID string `json:"messageID"`
 		Type      string `json:"type"`
@@ -324,74 +423,155 @@ type stdoutTextEvent struct {
 	} `json:"part"`
 }
 
-// assistantTextFromStdout reconstructs the final assistant message's text from
-// the run's NDJSON stdout, mirroring exportAssistantText's "last assistant
-// message wins" semantics. Text parts are keyed by part id (last value wins, so
-// a part that streams updates collapses to its final form) and grouped by
-// message id; the parts of the last message to emit text are concatenated in
-// first-seen order.
-//
-// This is only a fallback for when the session export can't be retrieved: it is
-// NOT a reliable source on its own, because opencode intermittently drops the
-// trailing text event, leaving the last surviving text part an earlier
-// (e.g. preamble) message rather than the real answer. Returns "" when stdout
-// carries no text part at all.
-func assistantTextFromStdout(stdout string) string {
-	var lastMsg string
-	textByPart := map[string]map[string]string{} // messageID -> partID -> text
-	partOrder := map[string][]string{}            // messageID -> partID order
-	sc := bufio.NewScanner(strings.NewReader(stdout))
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var ev stdoutTextEvent
-		if json.Unmarshal(line, &ev) != nil {
-			continue
-		}
-		if ev.Type != "text" || ev.Part.Type != "text" || ev.Part.Text == "" {
-			continue
-		}
-		mid := ev.Part.MessageID
-		if textByPart[mid] == nil {
-			textByPart[mid] = map[string]string{}
-		}
-		if _, seen := textByPart[mid][ev.Part.ID]; !seen {
-			partOrder[mid] = append(partOrder[mid], ev.Part.ID)
-		}
-		textByPart[mid][ev.Part.ID] = ev.Part.Text
-		lastMsg = mid
+// feed parses one raw stdout line, updating state and emitting on a boundary.
+func (sp *streamParser) feed(line []byte) {
+	sp.raw.Write(line)
+	sp.raw.WriteByte('\n')
+
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return
 	}
-	if lastMsg == "" {
-		return ""
+	var ev streamEvent
+	if json.Unmarshal(trimmed, &ev) != nil {
+		return
 	}
+	if sp.sessionID == "" && ev.SessionID != "" {
+		sp.sessionID = ev.SessionID
+	}
+	mid := ev.Part.MessageID
+	switch ev.Type {
+	case "step_start":
+		if mid != "" {
+			sp.lastMsgID = mid
+		}
+	case "text":
+		if mid == "" || ev.Part.Type != "text" || ev.Part.Text == "" {
+			return
+		}
+		sp.lastMsgID = mid
+		if sp.text[mid] == nil {
+			sp.text[mid] = map[string]string{}
+		}
+		if _, seen := sp.text[mid][ev.Part.ID]; !seen {
+			sp.partOrder[mid] = append(sp.partOrder[mid], ev.Part.ID)
+		}
+		sp.text[mid][ev.Part.ID] = ev.Part.Text
+	case "step_finish":
+		if mid == "" {
+			mid = sp.lastMsgID
+		}
+		sp.emitIfText(mid)
+	}
+}
+
+// assembled concatenates a message's text parts in first-seen order.
+func (sp *streamParser) assembled(mid string) string {
 	var b strings.Builder
-	for _, pid := range partOrder[lastMsg] {
-		b.WriteString(textByPart[lastMsg][pid])
+	for _, pid := range sp.partOrder[mid] {
+		b.WriteString(sp.text[mid][pid])
 	}
 	return b.String()
 }
 
-// exportAssistantTextRetry pulls the assistant text from the session export,
-// retrying while export errors (it is a read-only, idempotent DB read). Run in
-// the instant after `opencode run` exits, export crashes with empty output for
-// several seconds: the just-written session hasn't become visible in opencode's
-// SQLite store yet, and that window grows with session size (observed 4–7s on
-// large research turns against opencode 1.15.13). Retrying with capped backoff
-// until exportRetryBudget elapses converts that into a delivered reply rather
-// than an export_failed crash.
+// emitIfText delivers a completed message's text exactly once, if non-empty.
+func (sp *streamParser) emitIfText(mid string) {
+	sp.deliver(mid, sp.assembled(mid))
+}
+
+// flushFinal emits the last announced message from its accumulated stdout text
+// if it has not already been delivered (no closing step_finish arrived). Called
+// only after a clean exit, so the text is complete.
+func (sp *streamParser) flushFinal() {
+	if sp.lastMsgID != "" {
+		sp.emitIfText(sp.lastMsgID)
+	}
+}
+
+// emitExternal delivers text recovered from the export backstop for a message
+// stdout didn't already emit, preserving the "emit once" and ordering contract.
+// A message already streamed (matched by id) is skipped; an id-less export
+// message (malformed / test fixture) gets a synthetic key so it still emits.
+func (sp *streamParser) emitExternal(mid, text string) {
+	if mid == "" {
+		mid = fmt.Sprintf("__ext_%d", sp.extSeq)
+		sp.extSeq++
+	}
+	sp.deliver(mid, text)
+}
+
+func (sp *streamParser) deliver(mid, text string) {
+	if mid == "" || sp.emitted[mid] || strings.TrimSpace(text) == "" {
+		return
+	}
+	sp.emitted[mid] = true
+	sp.order = append(sp.order, mid)
+	sp.byID[mid] = text
+	if sp.onMessage != nil {
+		sp.onMessage(text)
+	}
+}
+
+func (sp *streamParser) rawStdout() string { return sp.raw.String() }
+func (sp *streamParser) count() int        { return len(sp.order) }
+
+// finalMessageID is the last messageID the run announced — the message the
+// export backstop must wait for before it is considered settled.
+func (sp *streamParser) finalMessageID() string { return sp.lastMsgID }
+
+// emittedFinal reports whether the final announced message was already emitted
+// from stdout (so no export tail recovery is needed).
+func (sp *streamParser) emittedFinal() bool {
+	return sp.lastMsgID != "" && sp.emitted[sp.lastMsgID]
+}
+
+// messages returns the emitted assistant messages in order.
+func (sp *streamParser) messages() []string {
+	out := make([]string, 0, len(sp.order))
+	for _, mid := range sp.order {
+		out = append(out, sp.byID[mid])
+	}
+	return out
+}
+
+// exportAssistantMessagesRetry reads the session's assistant messages, retrying
+// while the export errors (a read-only, idempotent DB read) or has not yet
+// settled. Right after `opencode run` exits, a fresh export can error with empty
+// output for several seconds — the just-written session is not yet visible in
+// opencode's SQLite store, and that window grows with session size (observed
+// 4–7s on large research turns against opencode 1.15.13). The session can also
+// be visible but mid-write: present yet missing its final message.
 //
-// It retries only on error — a successful export with empty assistant text is a
-// definitive "no answer", not a settle transient, so it returns immediately.
-// The last attempt's (text, err) is returned verbatim so the caller still
-// distinguishes export_failed (err != nil) from no_assistant_text (no err).
-func exportAssistantTextRetry(parent context.Context, bin, sessionID string, creds map[string]string) (string, error) {
+// "Settled" is keyed on finalID (the last messageID the run streamed): the
+// export is settled once it contains that message. This is far more precise than
+// "first non-empty read" — it is exactly what prevents a stale snapshot whose
+// tail is still a preamble from being accepted as the answer. When finalID is
+// unknown, fall back to "the last assistant message carries no tool call" (a
+// tool-call tail means the model will continue, i.e. mid-turn).
+//
+// On budget exhaustion the last (msgs, err) is returned verbatim so the caller
+// still distinguishes export_failed (err != nil) from no_assistant_text.
+func exportAssistantMessagesRetry(parent context.Context, bin, sessionID, finalID string, creds map[string]string) ([]exportMsg, error) {
 	ctx, cancel := context.WithTimeout(parent, exportRetryBudget)
 	defer cancel()
+	settled := func(msgs []exportMsg) bool {
+		if finalID == "" {
+			// stdout never announced a final message (degenerate: no step_start
+			// reached us). With no target to wait for, accept the first
+			// successful read — a parsed export is then definitive, including a
+			// definitive "no assistant message" (matches the legacy semantics
+			// and keeps the no_assistant_text path fast).
+			return true
+		}
+		for _, m := range msgs {
+			if m.ID == finalID {
+				return true
+			}
+		}
+		return false
+	}
 	var (
-		text    string
+		msgs    []exportMsg
 		err     error
 		backoff = exportBackoffMin
 	)
@@ -399,7 +579,7 @@ func exportAssistantTextRetry(parent context.Context, bin, sessionID string, cre
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return text, err // budget exhausted — surface the last failure
+				return msgs, err // budget exhausted — surface the last result
 			case <-time.After(backoff):
 			}
 			if backoff *= 2; backoff > exportBackoffMax {
@@ -407,18 +587,19 @@ func exportAssistantTextRetry(parent context.Context, bin, sessionID string, cre
 			}
 		}
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, DefaultExportTimeout)
-		text, err = exportAssistantText(attemptCtx, bin, sessionID, creds)
+		msgs, err = exportAssistantMessages(attemptCtx, bin, sessionID, creds)
 		attemptCancel()
-		if err == nil {
-			return text, nil // authoritative read (even if empty) — don't retry
+		if err == nil && settled(msgs) {
+			return msgs, nil
 		}
 		if ctx.Err() != nil {
-			return text, err
+			return msgs, err
 		}
 	}
 }
 
-func exportAssistantText(ctx context.Context, bin, sessionID string, creds map[string]string) (string, error) {
+// exportAssistantMessages returns the session's assistant messages in order.
+func exportAssistantMessages(ctx context.Context, bin, sessionID string, creds map[string]string) ([]exportMsg, error) {
 	cmd := exec.CommandContext(ctx, bin, "export", sessionID)
 	// Match the run env so auth.json + XDG resolution is consistent. We
 	// also propagate the same CredEnv: BYO-key vendors need their key
@@ -430,24 +611,28 @@ func exportAssistantText(ctx context.Context, bin, sessionID string, creds map[s
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("opencode export %s: %w (stderr=%s)", sessionID, err, stderr.String())
+		return nil, fmt.Errorf("opencode export %s: %w (stderr=%s)", sessionID, err, stderr.String())
 	}
 	var exp ocExport
 	if err := json.Unmarshal(stdout.Bytes(), &exp); err != nil {
-		return "", fmt.Errorf("opencode export %s: parse: %w", sessionID, err)
+		return nil, fmt.Errorf("opencode export %s: parse: %w", sessionID, err)
 	}
-	// Concatenate text parts from the final assistant message.
-	var lastText strings.Builder
+	var out []exportMsg
 	for _, m := range exp.Messages {
 		if m.Info.Role != "assistant" {
 			continue
 		}
-		lastText.Reset()
+		var b strings.Builder
+		hasTool := false
 		for _, p := range m.Parts {
-			if p.Type == "text" {
-				lastText.WriteString(p.Text)
+			switch p.Type {
+			case "text":
+				b.WriteString(p.Text)
+			case "tool":
+				hasTool = true
 			}
 		}
+		out = append(out, exportMsg{ID: m.Info.ID, Text: b.String(), HasTool: hasTool})
 	}
-	return lastText.String(), nil
+	return out, nil
 }

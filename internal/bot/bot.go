@@ -260,15 +260,28 @@ func (c *Core) HandleTrigger(ctx context.Context, m *adapter.MessageEvent) {
 		Body:        m.Body,
 	})
 
-	res, err := c.cfg.Pool.Run(ctx, workDir, userMsg, c.cfg.InvokeTimeout)
-	if err != nil {
-		c.cfg.Logger.Error("vendor pool failed", "err", err, "outcome", res.Outcome)
-	}
-
 	a := c.poster(m.Platform)
 	if a == nil {
 		c.cfg.Logger.Error("no adapter registered", "platform", m.Platform)
 		return
+	}
+
+	// Progressive delivery: post each assistant message the moment opencode
+	// finishes it (see [[reply]] — one platform message per assistant message),
+	// recording each to the transcript. streamed counts how many went out so the
+	// success path knows posting is already done. The callback runs on the
+	// invoker's stdout-reader goroutine, but the per-thread queue serializes
+	// triggers, so only one HandleTrigger touches this thread at a time.
+	var streamed int
+	stream := func(vendorID, text string) {
+		streamed++
+		pid, perr := a.Post(ctx, m.ThreadID, text)
+		c.appendBotReply(m, pid, text, "success", "", vendorID, perr)
+	}
+
+	res, err := c.cfg.Pool.Run(ctx, workDir, userMsg, c.cfg.InvokeTimeout, stream)
+	if err != nil {
+		c.cfg.Logger.Error("vendor pool failed", "err", err, "outcome", res.Outcome)
 	}
 
 	switch res.Outcome {
@@ -276,9 +289,14 @@ func (c *Core) HandleTrigger(ctx context.Context, m *adapter.MessageEvent) {
 		c.cfg.Logger.Info("invocation success",
 			"event", obs.InvocationSuccess,
 			"platform", m.Platform, "thread_id", m.ThreadID,
-			"vendor_id", res.VendorID, "attempts", len(res.Attempts))
-		pid, perr := a.Post(ctx, m.ThreadID, res.Text)
-		c.appendBotReply(m, pid, res.Text, "success", "", res.VendorID, perr)
+			"vendor_id", res.VendorID, "attempts", len(res.Attempts), "messages", streamed)
+		if streamed == 0 {
+			// Nothing was streamed (e.g. a non-streaming invoker). Post the
+			// final answer as a single message, the legacy one-reply path.
+			pid, perr := a.Post(ctx, m.ThreadID, res.Text)
+			c.appendBotReply(m, pid, res.Text, "success", "", res.VendorID, perr)
+		}
+		// else: every message was already posted as it completed.
 
 	case vendor.OutcomeTimeout:
 		rid := NewRequestID()

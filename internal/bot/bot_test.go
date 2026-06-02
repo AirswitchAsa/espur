@@ -195,3 +195,79 @@ func (f *fakeInvoker) Invoke(ctx context.Context, req opencode.Request) (opencod
 	f.results = f.results[1:]
 	return r, nil
 }
+
+// streamingInvoker streams each scripted message through req.OnMessage (as the
+// real invoker does per assistant message), then returns a Success result.
+type streamingInvoker struct{ msgs []string }
+
+func (s *streamingInvoker) Invoke(ctx context.Context, req opencode.Request) (opencode.Result, error) {
+	for _, m := range s.msgs {
+		if req.OnMessage != nil {
+			req.OnMessage(m)
+		}
+	}
+	last := ""
+	if len(s.msgs) > 0 {
+		last = s.msgs[len(s.msgs)-1]
+	}
+	return opencode.Result{
+		Outcome:       opencode.OutcomeSuccess,
+		AssistantText: last,
+		Messages:      s.msgs,
+		Streamed:      len(s.msgs) > 0,
+	}, nil
+}
+
+// TestBot_StreamsEachMessage verifies progressive delivery: every assistant
+// message opencode produces is posted as its own platform message, in order,
+// and recorded to the transcript — not collapsed into one reply.
+func TestBot_StreamsEachMessage(t *testing.T) {
+	want := []string{"let me check~", "still looking~", "the answer"}
+	inv := &streamingInvoker{msgs: want}
+	core, fa, _ := newCore(t, inv)
+
+	core.Dispatch(context.Background(), adapter.Event{Message: &adapter.MessageEvent{
+		Platform: "discord", ThreadID: "ch-1", PlatformMessageID: "m-1",
+		Author: adapter.Author{Label: "alice"}, Body: "ping", Mention: true,
+	}})
+
+	var got []string
+	for i := 0; i < len(want); i++ {
+		select {
+		case body := <-fa.done:
+			got = append(got, body)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only received %d/%d posts: %v", len(got), len(want), got)
+		}
+	}
+	if !equalSlice(got, want) {
+		t.Fatalf("posts = %v, want %v", got, want)
+	}
+
+	// Each streamed message is its own bot transcript record, in order.
+	recs, err := core.cfg.Transcript.TailAll("discord", "ch-1", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bots []string
+	for _, r := range recs {
+		if r.Kind == transcript.KindBot {
+			bots = append(bots, r.Body)
+		}
+	}
+	if !equalSlice(bots, want) {
+		t.Fatalf("transcript bot records = %v, want %v", bots, want)
+	}
+}
+
+func equalSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

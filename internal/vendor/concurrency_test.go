@@ -59,7 +59,7 @@ func TestPool_ConcurrencyCap_Bounds(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = p.Run(ctx, t.TempDir(), "x", 5*time.Second)
+			_, _ = p.Run(ctx, t.TempDir(), "x", 5*time.Second, nil)
 		}()
 	}
 
@@ -101,7 +101,7 @@ func TestPool_NoConcurrencyCap(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = p.Run(ctx, t.TempDir(), "x", 5*time.Second)
+			_, _ = p.Run(ctx, t.TempDir(), "x", 5*time.Second, nil)
 		}()
 	}
 

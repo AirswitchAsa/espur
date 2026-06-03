@@ -119,11 +119,11 @@ func (s *Servers) Invoke(ctx context.Context, req Request) (Result, error) {
 			Stderr: err.Error(), Duration: time.Since(start)}, err
 	}
 
-	events, unsub := conn.subscribe(sid)
+	events, lossy, unsub := conn.subscribe(sid)
 	defer unsub()
 
 	providerID, modelID := splitModel(req.Vendor.Model)
-	acc := newMsgAccumulator(req.OnMessage)
+	acc := newMsgAccumulator(req.OnMessage, lossy)
 
 	sendCh := make(chan sendResult, 1)
 	go func() {
@@ -136,7 +136,6 @@ func (s *Servers) Invoke(ctx context.Context, req Request) (Result, error) {
 		gotSend  bool
 		sessErr  json.RawMessage
 		idleSeen bool
-		timedOut bool
 	)
 	// consume folds one event in, reporting whether it was the turn-end marker.
 	consume := func(ev event) bool {
@@ -157,16 +156,19 @@ loop:
 			gotSend = true
 			break loop
 		case <-runCtx.Done():
-			timedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
 			break loop
 		}
 	}
 
 	res := Result{Duration: time.Since(start)}
 
-	// Timeout: abort the turn on the server and return whatever streamed. Spec:
-	// a timeout is not a vendor failure; already-streamed messages stand.
-	if timedOut && !gotSend {
+	// The loop only exits via the send returning or runCtx ending. If the send
+	// has not returned, runCtx ended first — a deadline (timeout) or a parent
+	// cancellation (e.g. shutdown). Either way: abort the turn on the server and
+	// return whatever already streamed. Neither penalizes the vendor, and
+	// already-streamed messages stand. We do NOT reconcile here — reconcile uses
+	// the parent ctx, which on cancellation is already dead.
+	if !gotSend {
 		actx, acancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = conn.abort(actx, sid)
 		acancel()
@@ -215,6 +217,12 @@ loop:
 	if listErr == nil {
 		for _, m := range msgs {
 			if m.Info.Role == "assistant" {
+				// A structured error can be recorded on the authoritative message
+				// even if its session.error event arrived after our drain window;
+				// capture it so it isn't misclassified as success.
+				if isNull(sessErr) && !isNull(m.Info.Error) {
+					sessErr = m.Info.Error
+				}
 				acc.emitText(m.Info.ID, m.text())
 			}
 		}
@@ -300,6 +308,7 @@ func splitModel(model string) (providerID, modelID string) {
 // (message.updated with time.completed) or recovered by the reconcile.
 type msgAccumulator struct {
 	onMessage func(string)
+	lossy     func() bool // reports whether the live SSE stream dropped an event
 
 	parts   map[string]map[string]string // messageID -> partID -> text
 	order   map[string][]string          // messageID -> partID first-seen order
@@ -309,9 +318,10 @@ type msgAccumulator struct {
 	extSeq  int                          // synthesizes keys for id-less messages
 }
 
-func newMsgAccumulator(onMessage func(string)) *msgAccumulator {
+func newMsgAccumulator(onMessage func(string), lossy func() bool) *msgAccumulator {
 	return &msgAccumulator{
 		onMessage: onMessage,
+		lossy:     lossy,
 		parts:     map[string]map[string]string{},
 		order:     map[string][]string{},
 		emitted:   map[string]bool{},
@@ -327,7 +337,16 @@ func (a *msgAccumulator) handle(ev event, sessErr *json.RawMessage) {
 			a.addPart(ev.Part.MessageID, ev.Part.ID, ev.Part.Text)
 		}
 	case "message.updated":
-		if ev.Info != nil && ev.Info.Role == "assistant" && ev.Info.Time.Completed > 0 {
+		// Emit live on completion only while the stream is healthy and the
+		// message has a real id. If the stream dropped an event this turn, the
+		// assembled text may be truncated (a part update was lost), so we defer
+		// to the post-turn reconcile against GET /message (authoritative, full
+		// text) instead of posting a truncated message the reconcile can't fix.
+		// Requiring a non-empty id also prevents a duplicate post: an id-less
+		// live emit (synthetic key) plus the same message re-emitted under its
+		// real id by the reconcile.
+		if ev.Info != nil && ev.Info.Role == "assistant" && ev.Info.Time.Completed > 0 &&
+			ev.Info.ID != "" && (a.lossy == nil || !a.lossy()) {
 			a.emitText(ev.Info.ID, a.assemble(ev.Info.ID))
 		}
 		if ev.Info != nil && !isNull(ev.Info.Error) {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/punny/espur/internal/adapter"
 	"github.com/punny/espur/internal/opencode"
+	"github.com/punny/espur/internal/transcript"
 )
 
 // gatedInvoker yields one result per call but only after release is closed,
@@ -102,6 +103,22 @@ func TestBot_BurstCoalesce_KeepsLatestOnly(t *testing.T) {
 	}
 	if strings.Contains(reqBody, "middle") {
 		t.Fatalf("<request> should not carry overwritten coalesce body; got %q", reqBody)
+	}
+
+	// The overwritten coalesce-slot message (m-2 "middle") must be recorded as
+	// coalesced into the winning trigger (m-3): a system back-pointer record.
+	all, err := core.cfg.Transcript.TailAll("discord", "ch-1", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range all {
+		if r.Kind == transcript.KindSystem && r.Meta.CoalescedInto == "discord:m-3" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a coalesced_into back-pointer record pointing at discord:m-3")
 	}
 }
 

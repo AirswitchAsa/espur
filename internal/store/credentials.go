@@ -62,6 +62,51 @@ func (d *DB) PutCredential(ctx context.Context, c Credential) error {
 	return err
 }
 
+// PutCredentialClearPenalty stores a vendor credential and resets that vendor's
+// penalty box to eligible in a single transaction. The web "set key" flow uses
+// it so the new key and the unlock that should accompany it can't be split by a
+// crash (leaving a key set but the vendor still auth_locked). The penalty clear
+// is unconditional and only applied for vendor-scoped credentials: supplying a
+// new key is exactly the remediation an auth_locked vendor needs.
+func (d *DB) PutCredentialClearPenalty(ctx context.Context, c Credential) error {
+	now := time.Now().Unix()
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = time.Unix(now, 0)
+	}
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO credentials(scope, id, kind, status, blob, env_keys, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(scope, id) DO UPDATE SET
+			kind       = excluded.kind,
+			status     = excluded.status,
+			blob       = excluded.blob,
+			env_keys   = excluded.env_keys,
+			updated_at = excluded.updated_at`,
+		c.Scope, c.ID, c.Kind, c.Status, c.Blob, strings.Join(c.EnvKeys, ","),
+		c.CreatedAt.Unix(), now); err != nil {
+		return err
+	}
+	if c.Scope != ConnScope { // only vendors have a penalty box
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO penalty(vendor_id, status, failure_streak, cooldown_until, updated_at)
+			VALUES (?, 'eligible', 0, NULL, ?)
+			ON CONFLICT(vendor_id) DO UPDATE SET
+				status         = 'eligible',
+				failure_streak = 0,
+				cooldown_until = NULL,
+				updated_at     = excluded.updated_at`,
+			c.ID, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // AnyCredentialBlob returns one encrypted blob from the table, used by the
 // secrets self-test at boot. Returns ErrNotFound when the table is empty.
 func (d *DB) AnyCredentialBlob(ctx context.Context) ([]byte, error) {

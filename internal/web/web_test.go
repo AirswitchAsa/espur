@@ -672,6 +672,70 @@ func TestThreadWipeMemory_KeepsAGENTSDropsSlugs(t *testing.T) {
 	}
 }
 
+func TestThreadDir_RefusesTraversal(t *testing.T) {
+	s, _ := newTestServer(t)
+	for _, c := range []struct{ platform, enc string }{
+		{"discord", "../../../etc"},
+		{"..", "../../etc"},
+		{"discord", ".."},
+		{".", "../secret"},
+	} {
+		rec := httptest.NewRecorder()
+		if dir, ok := s.threadDir(rec, c.platform, c.enc); ok {
+			t.Fatalf("threadDir(%q,%q) allowed escape -> %q", c.platform, c.enc, dir)
+		}
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("threadDir(%q,%q) status = %d, want 400", c.platform, c.enc, rec.Code)
+		}
+	}
+	rec := httptest.NewRecorder()
+	if _, ok := s.threadDir(rec, "discord", "abc123"); !ok {
+		t.Fatalf("normal thread dir wrongly rejected")
+	}
+}
+
+// TestThreadDetail_NoTraversalLeak ensures the read-only detail page can't be
+// coaxed into listing/reading files outside the threads root via %2f-encoded
+// path segments — the HIGH-severity gap the audit found.
+func TestThreadDetail_NoTraversalLeak(t *testing.T) {
+	s, _ := newTestServer(t)
+	secret := filepath.Join(s.ts.BaseDir, "secret.md")
+	if err := os.WriteFile(secret, []byte("TOPSECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/threads/x/..%2f..%2fsecret.md", nil))
+	if strings.Contains(rec.Body.String(), "TOPSECRET") {
+		t.Fatalf("threadDetail leaked content outside threads root (status %d)", rec.Code)
+	}
+}
+
+func TestCSRF_OriginCheck(t *testing.T) {
+	s, _ := newTestServer(t)
+	post := func(origin string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/vendors/add", strings.NewReader("vendor_id=x&model=a/b"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		s.Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+	// No Origin (proxy may strip it) — must NOT be blocked, or we break the UI.
+	if code := post(""); code == http.StatusForbidden {
+		t.Fatalf("no-origin POST should be allowed, got 403")
+	}
+	// Same-origin — allowed.
+	if code := post("http://example.com"); code == http.StatusForbidden {
+		t.Fatalf("same-origin POST should be allowed, got 403")
+	}
+	// Cross-origin — rejected.
+	if code := post("http://evil.example"); code != http.StatusForbidden {
+		t.Fatalf("cross-origin POST should be 403, got %d", code)
+	}
+}
+
 func TestThreadDelete_RemovesWorkdir(t *testing.T) {
 	s, _ := newTestServer(t)
 	platform, thread := "discord", "thread-del"

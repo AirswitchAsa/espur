@@ -67,11 +67,11 @@ type Manager struct {
 
 // running is the live state of one started connection.
 type running struct {
-	ad     adapter.Adapter
 	cancel context.CancelFunc
 	done   chan struct{}
 
 	mu    sync.Mutex
+	ad    adapter.Adapter // nil during the start window before the adapter is built
 	state string
 	qr    string
 }
@@ -87,6 +87,21 @@ func (r *running) set(state, qr string) {
 	defer r.mu.Unlock()
 	r.state = state
 	r.qr = qr
+}
+
+func (r *running) setAdapter(ad adapter.Adapter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ad = ad
+}
+
+// healthy reports the adapter's health, treating the pre-build start window
+// (ad still nil) as not-yet-healthy rather than dereferencing nil.
+func (r *running) healthy() bool {
+	r.mu.Lock()
+	ad := r.ad
+	r.mu.Unlock()
+	return ad != nil && ad.Healthy()
 }
 
 // New constructs a Manager.
@@ -164,8 +179,17 @@ func (m *Manager) Migrate(ctx context.Context, dataDir, discordToken string, wec
 			if err := ss.Save(data); err != nil {
 				return seeded, err
 			}
+			// The session now lives encrypted in the vault; the plaintext copy on
+			// disk is exactly the exposure migration exists to remove. Try to
+			// unlink it; if that fails, at least scrub its contents, and if even
+			// that fails, fail boot loudly rather than run with a readable secret
+			// sitting on disk.
 			if err := os.Remove(legacy); err != nil {
-				m.logger.Warn("could not remove legacy wechat session file",
+				if werr := os.WriteFile(legacy, []byte{}, 0o600); werr != nil {
+					return seeded, fmt.Errorf("connman: imported legacy wechat session but could not remove or scrub plaintext file %s: %w",
+						legacy, errors.Join(err, werr))
+				}
+				m.logger.Warn("scrubbed legacy wechat session content but could not unlink the file",
 					"event", "connection.migrate", "path", legacy, "err", err.Error())
 			}
 		}
@@ -193,7 +217,7 @@ func (m *Manager) List(ctx context.Context) ([]web.ConnInfo, error) {
 		m.mu.Unlock()
 		if r != nil {
 			v.State, v.QR = r.snapshot()
-			v.Healthy = r.ad.Healthy()
+			v.Healthy = r.healthy()
 		}
 		out = append(out, v)
 	}
@@ -279,9 +303,24 @@ func (m *Manager) start(conn store.Connection) error {
 		return nil // already running
 	}
 	base := m.baseCtx
+	// Reserve the slot now, before the slow build/Start, so a concurrent
+	// stop(conn.ID) (Disable/Delete) observes this in-flight start and can cancel
+	// it — rather than seeing nothing, no-op'ing, and leaving us to register a
+	// live adapter the operator already removed.
+	r := &running{state: StateStarting, done: make(chan struct{})}
+	m.running[conn.ID] = r
 	m.mu.Unlock()
 
-	r := &running{state: StateStarting, done: make(chan struct{})}
+	// fail rolls back the reservation and unblocks any stop() waiting on r.done.
+	fail := func(err error) error {
+		m.mu.Lock()
+		if m.running[conn.ID] == r { // still ours (a racing stop may have removed it)
+			delete(m.running, conn.ID)
+		}
+		m.mu.Unlock()
+		close(r.done)
+		return err
+	}
 
 	build := m.build
 	if m.buildFn != nil {
@@ -289,9 +328,9 @@ func (m *Manager) start(conn store.Connection) error {
 	}
 	ad, err := build(conn, r)
 	if err != nil {
-		return err
+		return fail(err)
 	}
-	r.ad = ad
+	r.setAdapter(ad)
 
 	rctx, cancel := context.WithCancel(base)
 	r.cancel = cancel
@@ -299,15 +338,29 @@ func (m *Manager) start(conn store.Connection) error {
 	ch, err := ad.Start(rctx)
 	if err != nil {
 		cancel()
-		return fmt.Errorf("connman: start %s: %w", conn.ID, err)
+		return fail(fmt.Errorf("connman: start %s: %w", conn.ID, err))
 	}
+
+	// If a stop() raced in while we were starting, it removed our reservation
+	// (and is waiting on r.done). Abort cleanly instead of registering: tear down
+	// the adapter we just started and drain its channel.
+	m.mu.Lock()
+	if m.running[conn.ID] != r {
+		m.mu.Unlock()
+		cancel()
+		go func() {
+			for range ch { // discard; the cancelled adapter will close ch
+			}
+		}()
+		close(r.done)
+		m.logger.Info("connection start aborted by concurrent stop",
+			"event", "connection.start_aborted", "connection", conn.ID)
+		return nil
+	}
+	m.mu.Unlock()
 
 	m.core.RegisterAdapter(ad)
 	m.web.RegisterAdapter(ad)
-
-	m.mu.Lock()
-	m.running[conn.ID] = r
-	m.mu.Unlock()
 
 	go m.fanIn(rctx, conn, r, ch)
 	m.logger.Info("connection started",
@@ -347,19 +400,33 @@ func (m *Manager) build(conn store.Connection, r *running) (adapter.Adapter, err
 func (m *Manager) fanIn(rctx context.Context, conn store.Connection, r *running, ch <-chan adapter.Event) {
 	defer close(r.done)
 	for ev := range ch {
-		if ev.Lifecycle != nil {
-			switch ev.Lifecycle.Kind {
-			case adapter.LifecycleConnected:
-				r.set(StateConnected, "")
-				m.deriveLabel(conn)
-			case adapter.LifecycleDisconnected:
-				r.set(StateDisconnected, "")
-			case adapter.LifecycleAuthRevoked:
-				r.set(StateAuthRevoked, "")
-			}
-		}
-		m.core.Dispatch(rctx, ev)
+		m.handleEvent(rctx, conn, r, ev)
 	}
+}
+
+// handleEvent processes one inbound event with panic isolation: a panic in a
+// lifecycle update or in core.Dispatch must not kill the fan-in goroutine (which
+// would leave r.done unclosed and wedge a later stop() that waits on it). One
+// bad event is logged and skipped; the connection keeps running.
+func (m *Manager) handleEvent(rctx context.Context, conn store.Connection, r *running, ev adapter.Event) {
+	defer func() {
+		if p := recover(); p != nil {
+			m.logger.Error("connection event handler panicked",
+				"event", "connection.event_panic", "connection", conn.ID, "panic", fmt.Sprint(p))
+		}
+	}()
+	if ev.Lifecycle != nil {
+		switch ev.Lifecycle.Kind {
+		case adapter.LifecycleConnected:
+			r.set(StateConnected, "")
+			m.deriveLabel(conn)
+		case adapter.LifecycleDisconnected:
+			r.set(StateDisconnected, "")
+		case adapter.LifecycleAuthRevoked:
+			r.set(StateAuthRevoked, "")
+		}
+	}
+	m.core.Dispatch(rctx, ev)
 }
 
 // deriveLabel updates the human display label from the platform after connect.

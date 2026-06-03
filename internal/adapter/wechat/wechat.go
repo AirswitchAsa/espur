@@ -165,6 +165,16 @@ func (a *Adapter) Start(ctx context.Context) (<-chan adapter.Event, error) {
 // so there is no concurrent send-after-close.
 func (a *Adapter) run(ctx context.Context) {
 	defer close(a.events)
+	// Backstop: a panic anywhere in login/Monitor must not crash the process and
+	// must still close the events channel (deferred above) so connman's fan-in
+	// unblocks and the connection is torn down cleanly.
+	defer func() {
+		if p := recover(); p != nil {
+			logLine("wechat.run.panic", map[string]any{"panic": fmt.Sprint(p)})
+			a.healthy.Store(false)
+			a.emit(a.lifecycle(adapter.LifecycleDisconnected, "recovered panic", 0))
+		}
+	}()
 
 	sess := a.loadSession()
 	client := a.newClient(sess.BotToken)
@@ -212,23 +222,34 @@ func (a *Adapter) run(ctx context.Context) {
 	a.healthy.Store(true)
 	a.emit(a.lifecycle(adapter.LifecycleConnected, "", 0))
 
-	err := client.Monitor(ctx, a.onMessage, &ilink.MonitorOptions{
+	// Monitor runs on its own cancellable context so session expiry can stop it
+	// promptly. Without this, the SDK handles an expired session by sleeping
+	// (~1h) and looping, leaving this adapter "running" but dead for an hour.
+	monitorCtx, cancelMonitor := context.WithCancel(ctx)
+	defer cancelMonitor()
+	var sessionExpired atomic.Bool
+
+	err := client.Monitor(monitorCtx, a.onMessage, &ilink.MonitorOptions{
 		InitialBuf:  sess.Cursor,
 		OnBufUpdate: a.saveCursor,
 		OnError: func(err error) {
 			logLine("wechat.poll.error", map[string]any{"err": err.Error()})
 		},
 		OnSessionExpired: func() {
+			sessionExpired.Store(true)
 			a.healthy.Store(false)
 			a.emit(a.lifecycle(adapter.LifecycleAuthRevoked, "session expired", 0))
-			// Wipe the saved token so the next boot forces a fresh QR scan.
+			// Wipe the saved token so the next boot forces a fresh QR scan, and
+			// cancel Monitor so it returns now instead of sleeping and retrying.
 			a.clearAuth()
+			cancelMonitor()
 		},
 	})
 
 	a.healthy.Store(false)
-	if ctx.Err() == nil {
-		// Monitor returned without a cancellation — an unexpected terminal exit.
+	if ctx.Err() == nil && !sessionExpired.Load() {
+		// Monitor returned without a parent cancellation or a handled session
+		// expiry — an unexpected terminal exit.
 		cause := ""
 		if err != nil {
 			cause = err.Error()
@@ -289,6 +310,10 @@ func (a *Adapter) emit(ev adapter.Event) {
 // MessageEvent. The thread is the DM peer (ThreadID -> FromUserID); a DM is
 // always an implicit mention, like Discord.
 func (a *Adapter) onMessage(msg ilink.WeixinMessage) {
+	// Monitor invokes this synchronously on the run goroutine; a panic here would
+	// otherwise unwind through Monitor and tear down the whole connection. Contain
+	// it to this one message so the poll loop keeps running.
+	defer func() { _ = recover() }()
 	// Self-echo: the bot's own outbound (and any bot-generated message)
 	// arrives with MessageType == MsgTypeBot; drop it so replies never loop.
 	// We deliberately do NOT filter on the login UserID: that id is the human
@@ -393,7 +418,7 @@ func (a *Adapter) Post(ctx context.Context, threadID, body string) (string, erro
 			return firstID, ctx.Err()
 		default:
 		}
-		id, err := client.SendText(ctx, threadID, ch, token)
+		id, err := sendWithRetry(ctx, client, threadID, ch, token)
 		if err != nil {
 			if isThreadGone(err) {
 				return firstID, adapter.ErrThreadGone
@@ -405,6 +430,36 @@ func (a *Adapter) Post(ctx context.Context, threadID, body string) (string, erro
 		}
 	}
 	return firstID, nil
+}
+
+// postBackoff is the per-attempt wait schedule for transient outbound failures,
+// so a single transient send error doesn't drop the whole reply. Spec:
+// adapter.dog.md "Outbound". A var so tests can shrink it.
+var postBackoff = []time.Duration{1 * time.Second, 3 * time.Second, 9 * time.Second}
+
+// sendWithRetry sends one chunk via the given client, retrying transient
+// failures with bounded backoff. A thread-gone error (expired context token) is
+// terminal.
+func sendWithRetry(ctx context.Context, cl ilinkClient, threadID, text, token string) (string, error) {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		id, err := cl.SendText(ctx, threadID, text, token)
+		if err == nil {
+			return id, nil
+		}
+		if isThreadGone(err) {
+			return "", err // terminal; caller maps to ErrThreadGone
+		}
+		lastErr = err
+		if attempt >= len(postBackoff) {
+			return "", lastErr
+		}
+		select {
+		case <-time.After(postBackoff[attempt]):
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 }
 
 // isThreadGone maps the SDK's "no cached token" sentinel to thread-gone

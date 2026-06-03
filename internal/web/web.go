@@ -181,7 +181,61 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /connections/{id}/delete", s.connDelete)
 	mux.HandleFunc("GET /connections/{id}/qr.png", s.connQR)
 	mux.HandleFunc("GET /health", s.healthPage)
-	return mux
+	return s.csrfGuard(mux)
+}
+
+// csrfGuard rejects state-changing requests whose Origin (or Referer) names a
+// different host than the one the request was sent to — a lenient same-origin
+// check that blocks classic CSRF without any session/token state. It is
+// deliberately permissive to avoid locking out the operator: a request with no
+// Origin and no Referer is allowed (some reverse proxies strip both), and hosts
+// listed in ESPUR_WEB_TRUSTED_ORIGINS (comma-separated host[:port]) are always
+// accepted for proxy setups that rewrite Host. The admin port is still expected
+// to sit behind reverse-proxy auth (see webui.dog.md); this is defense in depth.
+func (s *Server) csrfGuard(next http.Handler) http.Handler {
+	var trusted []string
+	for _, t := range strings.Split(os.Getenv("ESPUR_WEB_TRUSTED_ORIGINS"), ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			trusted = append(trusted, t)
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			// safe, non-mutating methods
+		default:
+			if !sameOrigin(r, trusted) {
+				http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// sameOrigin reports whether r's Origin/Referer host matches the request Host
+// (or a trusted override). A missing signal returns true — see csrfGuard.
+func sameOrigin(r *http.Request, trusted []string) bool {
+	src := r.Header.Get("Origin")
+	if src == "" {
+		src = r.Header.Get("Referer")
+	}
+	if src == "" {
+		return true
+	}
+	u, err := url.Parse(src)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Host == r.Host {
+		return true
+	}
+	for _, t := range trusted {
+		if u.Host == t {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- envelope + status strip ----------
@@ -652,14 +706,16 @@ func (s *Server) vendorSetKey(w http.ResponseWriter, r *http.Request) {
 	if envKey != "" {
 		envKeys = []string{envKey}
 	}
-	if err := s.db.PutCredential(ctx, store.Credential{
+	// Store the key and clear the vendor's penalty atomically: a new key is the
+	// remediation for an auth_locked vendor, and a crash between the two writes
+	// must not leave the key set while the vendor stays locked.
+	if err := s.db.PutCredentialClearPenalty(ctx, store.Credential{
 		Scope: "vendor", ID: id, Kind: "byo_key", Status: "set",
 		Blob: blob, EnvKeys: envKeys,
 	}); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	_ = s.pool.ClearPenalty(ctx, id)
 	setFlash(w, "ok", "Key set", "Credential stored for "+id+".")
 	http.Redirect(w, r, "/vendors", http.StatusSeeOther)
 }
@@ -667,11 +723,18 @@ func (s *Server) vendorSetKey(w http.ResponseWriter, r *http.Request) {
 func (s *Server) vendorToggle(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	ctx := r.Context()
-	vs, _ := s.db.ListVendors(ctx)
+	vs, err := s.db.ListVendors(ctx)
+	if err != nil {
+		setFlash(w, "danger", "Toggle failed", err.Error())
+		http.Redirect(w, r, "/vendors", http.StatusSeeOther)
+		return
+	}
 	for _, v := range vs {
 		if v.VendorID == id {
 			v.Enabled = !v.Enabled
-			_ = s.db.UpsertVendor(ctx, v)
+			if err := s.db.UpsertVendor(ctx, v); err != nil {
+				setFlash(w, "danger", "Toggle failed", err.Error())
+			}
 			break
 		}
 	}
@@ -680,14 +743,22 @@ func (s *Server) vendorToggle(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) vendorDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	_ = s.db.DeleteVendor(r.Context(), id)
+	if err := s.db.DeleteVendor(r.Context(), id); err != nil {
+		setFlash(w, "danger", "Delete failed", err.Error())
+		http.Redirect(w, r, "/vendors", http.StatusSeeOther)
+		return
+	}
 	setFlash(w, "ok", "Vendor deleted", id+" removed from the pool.")
 	http.Redirect(w, r, "/vendors", http.StatusSeeOther)
 }
 
 func (s *Server) vendorClearPenalty(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	_ = s.pool.ClearPenalty(r.Context(), id)
+	if err := s.pool.ClearPenalty(r.Context(), id); err != nil {
+		setFlash(w, "danger", "Clear failed", err.Error())
+		http.Redirect(w, r, "/vendors", http.StatusSeeOther)
+		return
+	}
 	setFlash(w, "ok", "Penalty cleared", id+" is eligible again.")
 	http.Redirect(w, r, "/vendors", http.StatusSeeOther)
 }
@@ -726,7 +797,9 @@ func (s *Server) vendorsReorder(w http.ResponseWriter, r *http.Request) {
 	for i, v := range vs {
 		ids[i] = v.VendorID
 	}
-	_ = s.db.ReorderVendors(ctx, ids)
+	if err := s.db.ReorderVendors(ctx, ids); err != nil {
+		setFlash(w, "danger", "Reorder failed", err.Error())
+	}
 	http.Redirect(w, r, "/vendors", http.StatusSeeOther)
 }
 
@@ -742,7 +815,11 @@ func (s *Server) vendorsReorderAll(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/vendors", http.StatusSeeOther)
 		return
 	}
-	_ = s.db.ReorderVendors(r.Context(), ids)
+	if err := s.db.ReorderVendors(r.Context(), ids); err != nil {
+		setFlash(w, "danger", "Reorder failed", err.Error())
+		http.Redirect(w, r, "/vendors", http.StatusSeeOther)
+		return
+	}
 	setFlash(w, "ok", "Priority updated", "Rotation order saved.")
 	http.Redirect(w, r, "/vendors", http.StatusSeeOther)
 }
@@ -875,10 +952,28 @@ func escapeForData(s string) string {
 	return b.String()
 }
 
+// threadDir resolves a thread's working directory from URL path values and
+// refuses any path that escapes the threads root (traversal guard). Go's mux
+// can decode `%2f` into a single {enc_id} segment, so `..` sequences must be
+// collapsed (filepath.Join calls Clean) and prefix-checked before any IO.
+// When ok is false an HTTP 400 has already been written to w.
+func (s *Server) threadDir(w http.ResponseWriter, platform, enc string) (string, bool) {
+	root := filepath.Join(s.ts.BaseDir, "threads")
+	dir := filepath.Join(root, platform, enc)
+	if !strings.HasPrefix(filepath.Clean(dir), filepath.Clean(root)+string(filepath.Separator)) {
+		http.Error(w, "refuse to act outside threads root", http.StatusBadRequest)
+		return "", false
+	}
+	return dir, true
+}
+
 func (s *Server) threadDetail(w http.ResponseWriter, r *http.Request) {
 	platform := r.PathValue("platform")
 	enc := r.PathValue("enc_id")
-	dir := filepath.Join(s.ts.BaseDir, "threads", platform, enc)
+	dir, ok := s.threadDir(w, platform, enc)
+	if !ok {
+		return
+	}
 	agentsBytes, _ := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
 
 	entries, _ := os.ReadDir(dir)
@@ -935,11 +1030,8 @@ func (s *Server) threadDetail(w http.ResponseWriter, r *http.Request) {
 func (s *Server) threadWipeMemory(w http.ResponseWriter, r *http.Request) {
 	platform := r.PathValue("platform")
 	enc := r.PathValue("enc_id")
-	dir := filepath.Join(s.ts.BaseDir, "threads", platform, enc)
-	// guardrail: refuse to act outside threads/
-	root := filepath.Join(s.ts.BaseDir, "threads")
-	if !strings.HasPrefix(filepath.Clean(dir), filepath.Clean(root)+string(filepath.Separator)) {
-		http.Error(w, "refuse to act outside threads root", http.StatusBadRequest)
+	dir, ok := s.threadDir(w, platform, enc)
+	if !ok {
 		return
 	}
 	entries, _ := os.ReadDir(dir)
@@ -965,11 +1057,8 @@ func (s *Server) threadWipeMemory(w http.ResponseWriter, r *http.Request) {
 func (s *Server) threadInstructions(w http.ResponseWriter, r *http.Request) {
 	platform := r.PathValue("platform")
 	enc := r.PathValue("enc_id")
-	dir := filepath.Join(s.ts.BaseDir, "threads", platform, enc)
-	// guardrail: refuse to write outside threads/
-	root := filepath.Join(s.ts.BaseDir, "threads")
-	if !strings.HasPrefix(filepath.Clean(dir), filepath.Clean(root)+string(filepath.Separator)) {
-		http.Error(w, "refuse to write outside threads root", http.StatusBadRequest)
+	dir, ok := s.threadDir(w, platform, enc)
+	if !ok {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -987,7 +1076,10 @@ func (s *Server) threadInstructions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	updated := memory.ReplaceUserInstructions(string(existing), r.FormValue("body"))
-	if err := os.WriteFile(agentsPath, []byte(updated), 0o644); err != nil {
+	// Atomic write: a crash mid-write or a concurrent invocation reading
+	// AGENTS.md must never see a truncated file. Write a sibling temp then
+	// rename (atomic within the same directory/filesystem).
+	if err := writeFileAtomic(agentsPath, []byte(updated), 0o644); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -998,16 +1090,41 @@ func (s *Server) threadInstructions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) threadDelete(w http.ResponseWriter, r *http.Request) {
 	platform := r.PathValue("platform")
 	enc := r.PathValue("enc_id")
-	dir := filepath.Join(s.ts.BaseDir, "threads", platform, enc)
-	// guardrail: refuse to delete anything outside threads/
-	root := filepath.Join(s.ts.BaseDir, "threads")
-	if !strings.HasPrefix(filepath.Clean(dir), filepath.Clean(root)+string(filepath.Separator)) {
-		http.Error(w, "refuse to delete outside threads root", 400)
+	dir, ok := s.threadDir(w, platform, enc)
+	if !ok {
 		return
 	}
-	_ = os.RemoveAll(dir)
+	if err := os.RemoveAll(dir); err != nil {
+		setFlash(w, "danger", "Delete failed", err.Error())
+		http.Redirect(w, r, "/threads/"+platform+"/"+enc, http.StatusSeeOther)
+		return
+	}
 	setFlash(w, "ok", "Workdir deleted", "Thread workdir and its files were removed.")
 	http.Redirect(w, r, "/threads", http.StatusSeeOther)
+}
+
+// writeFileAtomic writes data to a temp file in the same directory and renames
+// it into place, so a reader never observes a partially written file.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once renamed; cleans up on any error path
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // ---------- oauth ----------

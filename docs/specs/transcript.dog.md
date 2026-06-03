@@ -38,19 +38,19 @@ Every line is a JSON object with the fields below. `meta` is always present (pos
 
 - **kind = user**
   - `mention` (bool) — whether this message addressed the bot (explicit @-mention, or implicit DM).
-  - `coalesced_into` (string, optional) — set on user messages that were superseded by burst coalescing; value is the `platform_message_id` of the winning message that the bot ultimately replied to.
 - **kind = bot**
   - `reply_outcome` (string) — one of `success`, `timeout`, `drained`, `crash`.
   - `request_id` (string, optional) — present on `crash` outcomes (and useful on `drained` for log correlation); 8-char Crockford base32, matches the value in the user-visible reply.
 - **kind = system**
-  - `note` (string) — short tag identifying the system event (e.g. `timeout-aborted-previous-turn`). Used to give future invocations a stable signal that the prior turn didn't end normally.
+  - `note` (string) — short tag identifying the system event (e.g. `previous-turn-aborted`, `coalesced`).
+  - `coalesced_into` (string, optional) — on a `coalesced` back-pointer record: the `platform_message_id` of the winning (superseding) message. See the write rules below.
 
 **Write rules**
 
 - `kind = user` — appended by [[trigger]] on accept (after dedup), **regardless of whether the message mentions the bot**. Non-mention messages carry `meta.mention = false` and are still recorded, so the channel context reflects what was actually said. Espur thereby sees and stores every message in any channel or group it sits in; this is a deliberate consequence and is called out in the deploy documentation.
-- **Coalesced-away** user messages are recorded normally with `meta.coalesced_into` set to the winning message id. Transcript order preserves the message sequence as the user typed it; only the bot's reply (one record) attaches to the winning message.
+- **Coalesced-away** user messages are recorded normally as `kind = user` (they were said, and they appear in the thread-context tail like any other user message). Because the user record is appended durably the instant the message is accepted — before any later message could supersede it — and the log is append-only, the back-pointer is **not** written onto the user record. Instead, when burst coalescing folds an earlier queued message into a newer one, Espur appends a `kind = system` record with `note = "coalesced"` and `meta.coalesced_into` = the winning message's id. Transcript order preserves the message sequence as the user typed it; only the bot's reply (one record) attaches to the winning message.
 - `kind = bot` — appended once per logical reply, on successful first-chunk post by the adapter. `body` is the full reply text even when the IM platform required the adapter to split it into multiple chunks; chunking is a pure adapter render concern and is not visible in the transcript.
-- `kind = system` — appended sparingly. The current defined uses are: after a [[reply]] timeout/crash where the bot reply itself already carries the outcome (so a system line is *not* needed); and an explicit `previous-turn-aborted` line when no bot reply was posted at all (e.g. adapter-side post failure after exhausting its small retry window).
+- `kind = system` — appended sparingly. The current defined uses are: an explicit `previous-turn-aborted` line when no bot reply was posted at all (e.g. adapter-side post failure after exhausting its small retry window); and a `coalesced` back-pointer line when burst coalescing supersedes an earlier queued message (see above). After a [[reply]] timeout/crash the bot reply itself already carries the outcome, so no system line is needed there.
 - A failed inbound write (disk full, fs error) is logged and the trigger fails closed: no opencode invocation, no reply. The IM platform will retry the inbound webhook (or the user will resend); the deferred dedup record means we won't double-process once the disk situation recovers.
 
 **Read rules**
@@ -58,7 +58,7 @@ Every line is a JSON object with the fields below. `meta` is always present (pos
 - [[context-assembly]] reads the last N records and uses **only `kind = user` records** to populate the thread-context block. Bot replies are not echoed back into the model — opencode sees the user's side of the conversation plus the current request, and reasons fresh each turn.
 - `kind = system` records are also not surfaced to opencode by default; they exist for operator visibility and possible future use.
 - The web UI thread peek (see [[webui]]) decodes and renders all kinds, with visual differentiation by `kind`.
-- Malformed lines (e.g. a torn write from a crash) are skipped by the reader with a single log warning per file per process lifetime. The reader does not attempt to repair.
+- Malformed lines (e.g. a torn write from a crash) are skipped by the reader; it does not attempt to repair. The tail read is robust to a single corrupt **or oversized** line: it uses a line reader with no fixed maximum-token cap, so one giant line (a pasted blob) is read whole rather than aborting the read — a tail read must never fail the whole turn, since it runs on every trigger and a poisoned line would otherwise crash the thread permanently.
 
 ## Outcome
 

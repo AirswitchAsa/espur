@@ -56,13 +56,19 @@ func (v *Vault) Encrypt(plaintext []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// Decrypt is the inverse of Encrypt. Returns ErrMasterKeyMismatch on a wrong
-// identity (age does not currently distinguish "wrong key" from "malformed"
-// so we wrap any decryption failure).
+// Decrypt is the inverse of Encrypt. A well-formed blob that our identity simply
+// cannot open (age.NoIdentityMatchError) is reported as ErrMasterKeyMismatch — a
+// genuine wrong-master-key signal. A malformed/truncated/corrupt blob is a
+// different failure and is returned as-is, so a single bad row isn't misreported
+// as "wrong master key" (which would send the operator chasing the wrong fix).
 func (v *Vault) Decrypt(ciphertext []byte) ([]byte, error) {
 	r, err := age.Decrypt(bytes.NewReader(ciphertext), v.id)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrMasterKeyMismatch, err)
+		var noMatch *age.NoIdentityMatchError
+		if errors.As(err, &noMatch) {
+			return nil, fmt.Errorf("%w: %v", ErrMasterKeyMismatch, err)
+		}
+		return nil, fmt.Errorf("secrets: decrypt: %w", err)
 	}
 	return io.ReadAll(r)
 }

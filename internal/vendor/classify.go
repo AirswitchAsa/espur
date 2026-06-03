@@ -159,8 +159,22 @@ func errorEnvelope(stdout string) string {
 }
 
 func has5xx(hay string) bool {
+	// hay is the error envelope + synthesized stderr only (never assistant text
+	// or tool output — see Classify), so matching is safe from crawl-side noise.
 	for _, code := range []string{"500", "502", "503", "504", "529"} {
-		if strings.Contains(hay, `"statuscode":`+code) || strings.Contains(hay, "status code "+code) {
+		if strings.Contains(hay, `"statuscode":`+code) ||
+			strings.Contains(hay, "status code "+code) ||
+			strings.Contains(hay, "status "+code) ||
+			strings.Contains(hay, "http "+code) {
+			return true
+		}
+	}
+	// Standard HTTP reason phrases are unambiguous 5xx markers and cover the
+	// plain-text case where no numeric status is present in the error string.
+	for _, phrase := range []string{
+		"internal server error", "bad gateway", "service unavailable", "gateway timeout",
+	} {
+		if strings.Contains(hay, phrase) {
 			return true
 		}
 	}

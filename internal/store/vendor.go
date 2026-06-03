@@ -138,6 +138,27 @@ func (d *DB) GetPenalty(ctx context.Context, vendorID string) (Penalty, error) {
 	return p, nil
 }
 
+// ClearPenaltyOnSuccess resets a vendor to eligible after a successful turn, but
+// ONLY if it is not currently auth_locked. Two turns can target the same vendor
+// concurrently (per-thread serialization is per thread, not per vendor); one may
+// fail with an auth error and lock the vendor while another — which read the
+// penalty as eligible before that lock — succeeds. That stale success must not
+// silently resurrect a vendor the operator now has to reconfigure. The operator's
+// explicit "Clear penalty" still uses PutPenalty unconditionally.
+func (d *DB) ClearPenaltyOnSuccess(ctx context.Context, vendorID string, now time.Time) error {
+	_, err := d.sql.ExecContext(ctx, `
+		INSERT INTO penalty(vendor_id, status, failure_streak, cooldown_until, updated_at)
+		VALUES (?, 'eligible', 0, NULL, ?)
+		ON CONFLICT(vendor_id) DO UPDATE SET
+			status         = 'eligible',
+			failure_streak = 0,
+			cooldown_until = NULL,
+			updated_at     = excluded.updated_at
+		WHERE penalty.status != 'auth_locked'`,
+		vendorID, now.Unix())
+	return err
+}
+
 // PutPenalty upserts a penalty row.
 func (d *DB) PutPenalty(ctx context.Context, p Penalty) error {
 	var cooldown sql.NullInt64

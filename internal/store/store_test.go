@@ -84,6 +84,43 @@ func TestPenaltyDefault(t *testing.T) {
 	}
 }
 
+func TestClearPenaltyOnSuccess_RespectsAuthLock(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	now := time.Now()
+
+	// A cooldown vendor is cleared by a success (recovery works).
+	until := now.Add(time.Minute)
+	if err := db.PutPenalty(ctx, Penalty{VendorID: "cool", Status: PenaltyCooldown, FailureStreak: 3, CooldownUntil: &until}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ClearPenaltyOnSuccess(ctx, "cool", now); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := db.GetPenalty(ctx, "cool"); p.Status != PenaltyEligible || p.FailureStreak != 0 || p.CooldownUntil != nil {
+		t.Fatalf("cooldown not cleared by success: %+v", p)
+	}
+
+	// An auth_locked vendor is NOT resurrected by a stale concurrent success.
+	if err := db.PutPenalty(ctx, Penalty{VendorID: "locked", Status: PenaltyAuthLocked}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ClearPenaltyOnSuccess(ctx, "locked", now); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := db.GetPenalty(ctx, "locked"); p.Status != PenaltyAuthLocked {
+		t.Fatalf("auth_locked wrongly cleared by success: %+v", p)
+	}
+
+	// A brand-new vendor (no row) succeeding inserts an eligible row.
+	if err := db.ClearPenaltyOnSuccess(ctx, "fresh", now); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := db.GetPenalty(ctx, "fresh"); p.Status != PenaltyEligible {
+		t.Fatalf("fresh vendor should be eligible: %+v", p)
+	}
+}
+
 func TestDedup(t *testing.T) {
 	ctx := context.Background()
 	db := openTest(t)

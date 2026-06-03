@@ -36,7 +36,7 @@ Espur is running. The operator needs to (a) confirm the system is healthy, (b) d
 - Message bodies (user inbound, bot outbound) — never, at any level.
 - Credential values, OAuth tokens, master key bytes — never, at any level.
 - Webhook payload bodies — only size and first 200 bytes' worth of structural metadata, and only at `warn`/`error`.
-- `AGENTS.md` / `fact_*.md` contents — never. The web UI peek is the surface for that.
+- `AGENTS.md` / `memory_index.md` / `<slug>.md` memory contents — never. The web UI peek is the surface for that.
 
 Author labels, ids, message ids, vendor ids, thread ids (encoded), counts, durations, error categories — all OK.
 

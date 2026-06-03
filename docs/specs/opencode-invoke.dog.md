@@ -47,10 +47,14 @@ opencode serve --port <auto> --hostname 127.0.0.1 --log-level INFO
 The SSE event bus (`GET /event`) is the real-time channel. Espur reconstructs each assistant message from the events and emits it the moment it completes, so [[reply]] can post it while the run is still going:
 
 - `message.part.updated` carries a message's text part as it grows (repeated events for the same part id; last-value-wins, concatenated in first-seen order, keyed by `messageID`).
-- `message.updated` with `info.role == "assistant"` and `info.time.completed` set is the **per-message boundary**: that message's accumulated text, if non-empty, is emitted. Tool-only and empty messages emit nothing (they are working state, not a reply).
+- `message.updated` with `info.role == "assistant"` and `info.time.completed` set is the **per-message boundary**: that message's accumulated text, if non-empty and it has a real id, is emitted. Tool-only and empty messages emit nothing (they are working state, not a reply).
 - `session.idle` marks the end of the turn; `session.error` carries a structured failure.
 
-After the turn ends, Espur **reconciles** against the authoritative message list (`GET /session/<id>/message`) and emits, in order, any assistant text message the live stream did not already deliver. This replaces the old `opencode export` backstop entirely: the data is already complete in the server when the turn is idle, so there is **no settle race** to retry around. (If that read fails, Espur falls back to the synchronous response's final message.)
+The per-session SSE listener is buffered; if it ever overflows it drops an event rather than stalling every other session, and **records that the stream went lossy for this turn**. A dropped event can truncate a live-assembled message (a `message.part.updated` was lost), so on a lossy turn Espur **stops emitting live completions** and lets the reconcile below deliver the full, authoritative text — it never posts a truncated message that the reconcile could not then correct (because that message would already be marked delivered).
+
+After the turn ends, Espur **reconciles** against the authoritative message list (`GET /session/<id>/message`) and emits, in order, any assistant text message the live stream did not already deliver (and captures any error recorded on an authoritative message, in case its `session.error` arrived after the live drain window). This replaces the old `opencode export` backstop entirely: the data is already complete in the server when the turn is idle, so there is **no settle race** to retry around. (If that read fails, Espur falls back to the synchronous response's final message.)
+
+If the invocation context is cancelled before the synchronous send returns — a deadline (timeout) *or* a parent cancellation (shutdown) — Espur aborts the turn on the server and returns whatever already streamed, without reconciling against the now-dead context. Neither path penalizes the vendor.
 
 Other rules:
 
@@ -73,7 +77,7 @@ For each accepted trigger, exactly one terminal outcome is produced:
 
 Side effects of a successful invocation:
 
-- opencode may have created or modified files under the thread's working directory (`AGENTS.md`, `fact_<slug>.md`, etc.). Those changes are kept.
+- opencode may have created or modified files under the thread's working directory (`memory_index.md`, `<slug>.md` fact files, scratch, etc.). Those changes are kept.
 - The transcript is appended with both the user trigger (at enqueue) and the bot's reply (by [[reply]]).
 
 ## Notes

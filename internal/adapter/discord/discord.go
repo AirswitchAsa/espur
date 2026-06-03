@@ -79,9 +79,19 @@ func (a *Adapter) Start(ctx context.Context) (<-chan adapter.Event, error) {
 		}})
 	})
 	a.session.AddHandler(func(_ *discordgo.Session, _ *discordgo.Disconnect) {
+		// discordgo auto-reconnects under us, so a transient drop is "reconnecting",
+		// not a terminal disconnect — emitting Disconnected here made the status
+		// panel flap. A successful resume re-emits Connected via the Resumed handler
+		// below (Ready only fires on a fresh identify, not a resume).
 		a.healthy.Store(false)
 		a.emit(adapter.Event{Lifecycle: &adapter.LifecycleEvent{
-			Platform: a.Platform(), Kind: adapter.LifecycleDisconnected, At: time.Now(),
+			Platform: a.Platform(), Kind: adapter.LifecycleReconnecting, At: time.Now(),
+		}})
+	})
+	a.session.AddHandler(func(_ *discordgo.Session, _ *discordgo.Resumed) {
+		a.healthy.Store(true)
+		a.emit(adapter.Event{Lifecycle: &adapter.LifecycleEvent{
+			Platform: a.Platform(), Kind: adapter.LifecycleConnected, At: time.Now(),
 		}})
 	})
 	a.session.AddHandler(a.onMessage)
@@ -128,6 +138,10 @@ func (a *Adapter) emit(ev adapter.Event) {
 }
 
 func (a *Adapter) onMessage(_ *discordgo.Session, m *discordgo.MessageCreate) {
+	// discordgo dispatches handlers in their own goroutines and does not recover
+	// panics, so a panic in normalizeBody/emit would crash the whole process.
+	// Contain it to this one message (it is dropped; the transport stays up).
+	defer func() { _ = recover() }()
 	if m.Author == nil || m.Author.Bot {
 		return // drop our own echoes and any other bot's messages
 	}
@@ -185,6 +199,13 @@ func normalizeBody(m *discordgo.Message, botUserID string) (string, bool) {
 	return strings.TrimSpace(body), mentioned
 }
 
+// postBackoff is the per-attempt wait schedule for transient outbound failures.
+// Spec: adapter.dog.md "Outbound" — bounded retry so a single transient send
+// error doesn't drop the whole reply. (discordgo handles HTTP 429/Retry-After
+// internally via its rate limiter, so 429 rarely surfaces as an error here.)
+// A var so tests can shrink it.
+var postBackoff = []time.Duration{1 * time.Second, 3 * time.Second, 9 * time.Second}
+
 // Post implements the outbound side. The full body is split into the minimum
 // number of <=MaxChunk chunks; each chunk is posted sequentially. Returns the
 // platform-native ID of the first chunk for transcript correlation.
@@ -195,7 +216,7 @@ func (a *Adapter) Post(ctx context.Context, threadID, body string) (string, erro
 	}
 	var firstID string
 	for i, ch := range chunks {
-		msg, err := a.session.ChannelMessageSend(threadID, ch)
+		msg, err := a.sendWithRetry(ctx, threadID, ch)
 		if err != nil {
 			if isThreadGone(err) {
 				return firstID, adapter.ErrThreadGone
@@ -207,6 +228,30 @@ func (a *Adapter) Post(ctx context.Context, threadID, body string) (string, erro
 		}
 	}
 	return firstID, nil
+}
+
+// sendWithRetry posts one chunk, retrying transient failures with bounded
+// backoff. A thread-gone error is terminal (returned immediately, no retry).
+func (a *Adapter) sendWithRetry(ctx context.Context, threadID, text string) (*discordgo.Message, error) {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		msg, err := a.session.ChannelMessageSend(threadID, text)
+		if err == nil {
+			return msg, nil
+		}
+		if isThreadGone(err) {
+			return nil, err // terminal; the caller maps it to ErrThreadGone
+		}
+		lastErr = err
+		if attempt >= len(postBackoff) {
+			return nil, lastErr
+		}
+		select {
+		case <-time.After(postBackoff[attempt]):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 func isThreadGone(err error) bool {

@@ -168,6 +168,19 @@ func TestClassify_Buckets(t *testing.T) {
 			}
 		})
 	}
+
+	// Plain-text 5xx in the synthesized failure string (no JSON statusCode) must
+	// still classify as ClassServer5xx so it falls through rather than crashing.
+	for _, s := range []string{
+		"opencode http 503: service unavailable",
+		"server returned 500 internal server error",
+		"http 502 bad gateway",
+		"status 504 gateway timeout",
+	} {
+		if got := Classify("", s); got != ClassServer5xx {
+			t.Fatalf("Classify(stderr=%q) = %d, want ClassServer5xx", s, got)
+		}
+	}
 }
 
 // TestClassify_IgnoresToolOutput is the regression guard for the false

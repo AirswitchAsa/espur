@@ -29,6 +29,8 @@ import (
 type Servers struct {
 	mu      sync.Mutex
 	conns   map[string]*serverConn
+	pending map[string]*pendingSpawn // vendor_id -> in-flight spawn (lock released while it runs)
+	closed  bool
 	binPath string
 	logger  *slog.Logger
 	httpc   *http.Client
@@ -37,6 +39,16 @@ type Servers struct {
 	// process is spawned. Used by the in-package tests to point Invoke at an
 	// httptest server.
 	testConn *serverConn
+}
+
+// pendingSpawn lets concurrent acquires for the same vendor share one spawn
+// instead of each starting (and killing) a redundant server. The map lock is
+// released while a spawn runs, so cold-starting one vendor never blocks acquires
+// for a different (or already-warm) vendor.
+type pendingSpawn struct {
+	done chan struct{}
+	conn *serverConn
+	err  error
 }
 
 // healthDeadline bounds how long acquire waits for a freshly spawned server to
@@ -55,6 +67,7 @@ func NewServers(binPath string, logger *slog.Logger) *Servers {
 	}
 	return &Servers{
 		conns:   map[string]*serverConn{},
+		pending: map[string]*pendingSpawn{},
 		binPath: binPath,
 		logger:  logger,
 		// One client shared across all servers. No global timeout: a turn can
@@ -84,24 +97,60 @@ func (s *Servers) acquire(ctx context.Context, vendor Vendor) (*serverConn, erro
 	if s.testConn != nil {
 		return s.testConn, nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if conn := s.conns[vendor.VendorID]; conn != nil {
-		if conn.alive() {
-			return conn, nil
+	id := vendor.VendorID
+	for {
+		s.mu.Lock()
+		if conn := s.conns[id]; conn != nil {
+			if conn.alive() {
+				s.mu.Unlock()
+				return conn, nil
+			}
+			// Stale/dead entry — tear it down and respawn below.
+			conn.close()
+			delete(s.conns, id)
 		}
-		// Stale/dead entry — tear it down and respawn below.
-		conn.close()
-		delete(s.conns, vendor.VendorID)
-	}
+		// A spawn for this vendor is already in flight — wait for it instead of
+		// starting a second server. The lock is held only to read s.pending.
+		if p := s.pending[id]; p != nil {
+			s.mu.Unlock()
+			select {
+			case <-p.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			if p.err != nil {
+				return nil, p.err
+			}
+			// Spawn succeeded; loop to pick up the (still-alive) conn.
+			continue
+		}
+		// We own the spawn. Publish a placeholder and release the lock so other
+		// vendors' acquires proceed while this one starts (health-wait is slow).
+		p := &pendingSpawn{done: make(chan struct{})}
+		s.pending[id] = p
+		s.mu.Unlock()
 
-	conn, err := s.spawn(ctx, vendor)
-	if err != nil {
-		return nil, err
+		conn, err := s.spawn(ctx, vendor)
+
+		s.mu.Lock()
+		delete(s.pending, id)
+		if err == nil && s.closed {
+			// Manager shut down mid-spawn; don't leak the child.
+			conn.close()
+			conn, err = nil, fmt.Errorf("opencode: servers closed")
+		}
+		if err == nil {
+			s.conns[id] = conn
+		}
+		p.conn, p.err = conn, err
+		close(p.done)
+		s.mu.Unlock()
+
+		if err != nil {
+			return nil, err
+		}
+		return conn, nil
 	}
-	s.conns[vendor.VendorID] = conn
-	return conn, nil
 }
 
 // spawn starts a new `opencode serve` for the vendor, waits for it to become
@@ -143,6 +192,7 @@ func (s *Servers) spawn(ctx context.Context, vendor Vendor) (*serverConn, error)
 // have drained.
 func (s *Servers) Close() {
 	s.mu.Lock()
+	s.closed = true
 	conns := make([]*serverConn, 0, len(s.conns))
 	for id, conn := range s.conns {
 		conns = append(conns, conn)

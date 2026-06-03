@@ -46,6 +46,22 @@ func TestSelfTest_WrongKey(t *testing.T) {
 	}
 }
 
+// TestDecrypt_CorruptBlobNotKeyMismatch guards the narrowed error: a malformed
+// blob is a corruption failure, not a wrong-master-key signal, so it must not
+// surface as ErrMasterKeyMismatch (which would send the operator chasing the
+// wrong fix and could abort boot citing the wrong cause).
+func TestDecrypt_CorruptBlobNotKeyMismatch(t *testing.T) {
+	k, _ := GenerateIdentity()
+	v, _ := New(k)
+	_, err := v.Decrypt([]byte("this is not a valid age ciphertext"))
+	if err == nil {
+		t.Fatal("expected an error decrypting garbage")
+	}
+	if errors.Is(err, ErrMasterKeyMismatch) {
+		t.Fatalf("corrupt blob must not be reported as master-key mismatch: %v", err)
+	}
+}
+
 func TestSelfTest_EmptyDB(t *testing.T) {
 	k, _ := GenerateIdentity()
 	v, _ := New(k)

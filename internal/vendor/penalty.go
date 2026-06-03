@@ -52,13 +52,9 @@ func applyFailure(p store.Penalty, class FailureClass, now time.Time, rng *rand.
 	return p
 }
 
-func applySuccess(p store.Penalty, now time.Time) store.Penalty {
-	p.FailureStreak = 0
-	p.Status = store.PenaltyEligible
-	p.CooldownUntil = nil
-	p.UpdatedAt = now
-	return p
-}
+// Success clears penalty state via store.ClearPenaltyOnSuccess (a conditional
+// update that won't resurrect an auth_locked vendor — see pool.go), so there is
+// deliberately no applySuccess helper here.
 
 // isEligible reports whether p is currently eligible at the given instant.
 // Cooldown lapses lazily on consult per spec.

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,9 +33,20 @@ type serverConn struct {
 	cancel context.CancelFunc
 
 	mu        sync.Mutex
-	listeners map[string]chan event
+	listeners map[string]*sseListener
 	closed    bool
 	exited    bool // set by the reaper when the child process exits
+}
+
+// sseListener is one session's event channel plus a flag the SSE router sets if
+// it ever had to drop an event for this session (buffer full). A dropped event
+// means the live stream is lossy for this turn, so the invoker stops trusting
+// live completions and falls back to the authoritative reconcile — see
+// Servers.Invoke. Without this, a dropped text part would make the live
+// completion emit truncated text and the reconcile silently no-op.
+type sseListener struct {
+	ch      chan event
+	dropped atomic.Bool
 }
 
 // processHandle is the slice of *exec.Cmd serverConn needs; an interface so
@@ -53,7 +65,7 @@ func newServerConn(baseURL string, httpc *http.Client, logger *slog.Logger, cmd 
 		cmd:       cmd,
 		ctx:       ctx,
 		cancel:    cancel,
-		listeners: map[string]chan event{},
+		listeners: map[string]*sseListener{},
 	}
 }
 
@@ -166,16 +178,18 @@ func (e *httpError) Error() string {
 
 // --- SSE subscription ---
 
-// subscribe registers a listener for one session's events and returns it with an
-// unsubscribe func. The channel is buffered; if it ever fills, the SSE reader
-// drops events for this session rather than stalling every other session — the
-// post-turn reconcile against listMessages guarantees no message is lost.
-func (c *serverConn) subscribe(sid string) (<-chan event, func()) {
-	ch := make(chan event, 256)
+// subscribe registers a listener for one session's events. It returns the event
+// channel, a lossy() predicate that reports whether the SSE reader ever had to
+// drop an event for this session, and an unsubscribe func. The channel is
+// buffered; if it ever fills, the reader drops events (and sets lossy) rather
+// than stalling every other session. The invoker uses lossy() to decide between
+// trusting live completions and falling back to the authoritative reconcile.
+func (c *serverConn) subscribe(sid string) (events <-chan event, lossy func() bool, unsub func()) {
+	l := &sseListener{ch: make(chan event, 256)}
 	c.mu.Lock()
-	c.listeners[sid] = ch
+	c.listeners[sid] = l
 	c.mu.Unlock()
-	return ch, func() {
+	return l.ch, l.dropped.Load, func() {
 		c.mu.Lock()
 		delete(c.listeners, sid)
 		c.mu.Unlock()
@@ -187,14 +201,15 @@ func (c *serverConn) route(ev event) {
 		return
 	}
 	c.mu.Lock()
-	ch := c.listeners[ev.SessionID]
+	l := c.listeners[ev.SessionID]
 	c.mu.Unlock()
-	if ch == nil {
+	if l == nil {
 		return
 	}
 	select {
-	case ch <- ev:
+	case l.ch <- ev:
 	default:
+		l.dropped.Store(true)
 		c.logger.Debug("opencode sse listener buffer full; dropping event (reconcile will recover)",
 			"session_id", ev.SessionID, "event_type", ev.Type)
 	}

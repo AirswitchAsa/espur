@@ -5,7 +5,7 @@ Espur is a single Go binary that:
 1. Listens to one or more IM platforms via thin adapters (Discord, WeChat, ...).
 2. When @mentioned on a thread, assembles a fresh context and shells out to `opencode run`.
 3. Posts opencode's reply back to the thread.
-4. Lets opencode maintain its own long-term memory in an `AGENTS.md`-shaped index, scoped per thread.
+4. Lets opencode maintain its own long-term memory — a per-thread `memory_index.md` index with `<slug>.md` detail files — scoped per thread.
 
 It is **not** a coding agent for your phone. It is **not** a multi-user SaaS. It is a personal-deploy chat surface for getting work done through opencode from inside IM clients.
 
@@ -30,10 +30,13 @@ The assembled user message contains:
 - **Thread context** — last N lines of the channel transcript, verbatim, labelled as recent conversation.
 - **Request** — the current incoming message, highlighted as the thing to act on.
 
+Espur also inlines the thread's `AGENTS.md` (memory instructions + operator persona) into a stable, cache-friendly prefix at the front of the message, so the memory rules are always in context. The index and detail files themselves are **not** inlined — the agent reads them on demand.
+
 The working directory for opencode persists per thread and contains:
 
-- `AGENTS.md` — the memory index, owned and edited by opencode itself.
-- `fact_<slug>.md` — detail files written by opencode when something is worth more than a one-liner.
+- `AGENTS.md` — the memory instructions (seeded) plus an operator-editable custom-instructions block. Inlined into the prompt each turn; not used as the index.
+- `memory_index.md` — the one-line-per-entry index, owned and edited by opencode itself.
+- `<slug>.md` — detail files written by opencode when something is worth more than a one-liner.
 - Any scratch files opencode chooses to keep.
 
 See [`specs/context-assembly.dog.md`](specs/context-assembly.dog.md), [`specs/transcript.dog.md`](specs/transcript.dog.md).
@@ -42,13 +45,15 @@ See [`specs/context-assembly.dog.md`](specs/context-assembly.dog.md), [`specs/tr
 
 Espur seeds each new thread's `AGENTS.md` with instructions telling opencode to:
 
-- Treat the file as a long-term memory index across conversations on this thread.
-- Keep entries to **one line each**, in the form `[short title](fact_<slug>.md) — gloss`.
-- Write detail to a new `fact_<slug>.md` and add an index entry pointing to it.
+- Treat the working directory as long-term, per-thread memory across conversations.
+- Keep a `memory_index.md` index with entries **one line each**, in the form `[short title](<slug>.md) — gloss`.
+- Write detail to a new `<slug>.md` and add an index entry pointing to it.
 - Read detail files on demand via the `read` tool rather than expanding the index.
 - Update or remove entries when facts change.
 
-Espur does **not** parse or enforce memory format at runtime. The discipline lives in the seed prompt. If it breaks down in practice, structural enforcement gets bolted on later.
+`AGENTS.md` also carries an operator-editable custom-instructions block (persona, tone, do/don't rules) that the operator sets from the admin UI.
+
+Espur does **not** parse or enforce memory format at runtime (it only inlines `AGENTS.md` verbatim, and the admin UI edits the operator block). The discipline lives in the seed prompt. If it breaks down in practice, structural enforcement gets bolted on later.
 
 See [`specs/memory-seed.dog.md`](specs/memory-seed.dog.md).
 
@@ -79,10 +84,10 @@ A small admin UI on a separate port. Scope:
 - Configure provider credentials (BYO keys; OAuth flows for ChatGPT / Claude subs are delegated to `opencode auth login` — see [`specs/oauth.dog.md`](specs/oauth.dog.md)).
 - Order the vendor priority list.
 - See penalty-box state per vendor.
-- List threads with their claim status, working-dir size, and last activity.
-- Peek at a thread's `AGENTS.md` and recent transcript.
+- Manage IM connections (add / enable / disable / delete Discord and WeChat connections, WeChat QR login) — see [`specs/adapter.dog.md`](specs/adapter.dog.md).
+- List threads with their claim status, working-dir size, and last activity; per-thread: peek at memory files + transcript, edit the operator custom-instructions block, wipe memory, or delete the thread workdir.
 
-No analytics, no per-thread settings panel (use sensible defaults), no separate logs viewer (use host logs).
+No analytics, no per-thread settings panel beyond instructions (use sensible defaults), no separate logs viewer (use host logs).
 
 See [`specs/webui.dog.md`](specs/webui.dog.md).
 

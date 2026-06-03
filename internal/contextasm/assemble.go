@@ -19,9 +19,11 @@ const DefaultTailN = 15
 // thread-context block; the current request is always preserved verbatim.
 const MaxBytes = 8 * 1024
 
-// MaxAgentsMDBytes caps the inlined AGENTS.md content. If memory grows past
-// this, the agent should move detail into fact_*.md files (see memory-seed
-// spec); we still truncate as a guardrail rather than risk a runaway prompt.
+// MaxAgentsMDBytes caps the inlined AGENTS.md content. AGENTS.md holds the
+// memory instructions plus the operator's custom-instruction block; the actual
+// remembered facts live in memory_index.md + <slug>.md files, which are not
+// inlined (see memory-seed spec). We still truncate as a guardrail rather than
+// risk a runaway prompt.
 const MaxAgentsMDBytes = 16 * 1024
 
 // Prefix is the stable, per-thread header content. The same Prefix produces
@@ -56,7 +58,7 @@ func Assemble(prefix Prefix, tailRecords []transcript.Record, current Trigger) s
 		if len(md) > MaxAgentsMDBytes {
 			md = md[:MaxAgentsMDBytes]
 		}
-		b.WriteString("<memory note=\"AGENTS.md for this thread; fact_*.md files live alongside it\">\n")
+		b.WriteString("<memory note=\"AGENTS.md for this thread; the memory_index.md index and its &lt;slug&gt;.md fact files live alongside it\">\n")
 		b.WriteString(md)
 		if !strings.HasSuffix(md, "\n") {
 			b.WriteByte('\n')

@@ -64,6 +64,7 @@ A failure causes:
   - `failure_streak = 0`.
   - `status = eligible`.
   - `cooldown_until = null`.
+  - **Except**: a success does **not** clear an `auth_locked` status. Two turns can target the same vendor concurrently (per-thread serialization is per thread, not per vendor); if one fails with an auth error and locks the vendor while another — which read the penalty as eligible before that lock — succeeds, that stale success must not silently resurrect a vendor the operator now has to reconfigure. The clear is a conditional update (`status != auth_locked`); only the operator's explicit web-UI action (save new credentials / clear lock) unlocks it.
 - Cooldown expires lazily: when the vendor is next consulted and `now >= cooldown_until`, it is treated as `eligible` for that attempt. A failed re-attempt re-enters cooldown at the next backoff step (does not reset the streak unless the attempt succeeded).
 
 **All-drained behavior**

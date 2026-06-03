@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/punny/espur/internal/adapter"
+	"github.com/punny/espur/internal/transcript"
 )
 
 // threadQueue serializes trigger processing for one thread. At most one trigger
@@ -54,9 +55,26 @@ func (c *Core) enqueue(ctx context.Context, m *adapter.MessageEvent) {
 		go q.work(m)
 		return
 	}
-	firstCoalesce := q.coalesce == nil
+	superseded := q.coalesce // non-nil when an earlier burst message is being folded away
+	firstCoalesce := superseded == nil
 	q.coalesce = m
 	c.mu.Unlock()
+	if superseded != nil {
+		// An earlier queued message is being coalesced into this newer one. Its
+		// own user record was already written durably in onMessage; append a
+		// back-pointer record so the transcript shows it was folded into a later
+		// trigger (winner), not silently ignored. Done outside core.mu (it is
+		// file IO) and as a system record so context-assembly still leaves the
+		// superseded user message in the tail. See transcript.dog.md.
+		_ = c.cfg.Transcript.Append(superseded.Platform, superseded.ThreadID, transcript.Record{
+			Kind: transcript.KindSystem,
+			Body: "message coalesced into a later trigger",
+			Meta: transcript.Meta{
+				Note:          "coalesced",
+				CoalescedInto: m.Platform + ":" + m.PlatformMessageID,
+			},
+		})
+	}
 	if firstCoalesce {
 		// Best-effort "still thinking" ack — one per coalesced run.
 		go q.ack(ctx, m.ThreadID)

@@ -28,7 +28,7 @@ type Config struct {
 	Transcript      *transcript.Store
 	DashboardURL    string
 	InvokeTimeout   time.Duration // per opencode-invoke.dog.md default 120s
-	TranscriptTailN int           // context-assembly.dog.md default 30
+	TranscriptTailN int           // context-assembly.dog.md default 15
 	Logger          *slog.Logger
 }
 
@@ -269,9 +269,11 @@ func (c *Core) HandleTrigger(ctx context.Context, m *adapter.MessageEvent) {
 	// Progressive delivery: post each assistant message the moment opencode
 	// finishes it (see [[reply]] — one platform message per assistant message),
 	// recording each to the transcript. streamed counts how many went out so the
-	// success path knows posting is already done. The callback runs on the
-	// invoker's stdout-reader goroutine, but the per-thread queue serializes
-	// triggers, so only one HandleTrigger touches this thread at a time.
+	// success path knows posting is already done. The callback is invoked
+	// synchronously on the same goroutine as this HandleTrigger (Pool.Run →
+	// opencode.Invoke runs the SSE event loop on the calling goroutine and never
+	// calls back concurrently — see opencode.Request.OnMessage), so streamed is
+	// touched by a single goroutine and needs no synchronization.
 	var streamed int
 	stream := func(vendorID, text string) {
 		streamed++

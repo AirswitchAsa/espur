@@ -45,8 +45,8 @@ The complete set of state that survives a restart:
 
 - `data/espur.db` (SQLite): vendor list + priority, encrypted credentials + metadata (BYO API keys, plus per-connection Discord tokens and WeChat iLink session blobs under scope `connection`), penalty-box state per vendor, message-ID dedup table per platform, the connections registry, any future operator-facing tables.
 - `$XDG_DATA_HOME/opencode/auth.json` (under `data/xdg-data/` by default): opencode's own auth file holding OAuth bundles. Owned and rotated by `opencode auth login` — see [[oauth]]. Espur reads it for `/oauth` display only.
-- The WeChat iLink session (`bot_token`, `bot_id`, `user_id`, connected `base_url`, and the `getUpdates` long-poll cursor) is persisted encrypted in the credentials table for a web-managed connection — so subsequent boots skip the QR-login step and resume polling where they left off. The standalone `cmd/wechat-login` helper still uses a `data/wechat-session.json` file for headless first-login; the migrate-once step imports such a file into the vault and removes it.
-- `data/threads/<platform>/<encoded_id>/`: per-thread working directory containing `AGENTS.md`, any `fact_*.md` opencode wrote, the `transcript.jsonl`, and any opencode-side scratch.
+- The WeChat iLink session (`bot_token`, `bot_id`, `user_id`, connected `base_url`, and the `getUpdates` long-poll cursor) is persisted encrypted in the credentials table for a web-managed connection — so subsequent boots skip the QR-login step and resume polling where they left off. The standalone `cmd/wechat-login` helper still uses a `data/wechat-session.json` file for headless first-login; the migrate-once step imports such a file into the vault and then removes the plaintext copy — failing boot loudly if it can neither unlink nor scrub the file, rather than continuing with a readable secret on disk.
+- `data/threads/<platform>/<encoded_id>/`: per-thread working directory containing `AGENTS.md` (seed + operator instructions), the agent's `memory_index.md` and `<slug>.md` memory files, the `transcript.jsonl`, and any opencode-side scratch.
 
 Everything else is process-local and recomputed at boot:
 

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,47 +102,27 @@ func (s *Store) Append(platform, threadID string, r Record) error {
 }
 
 // TailUserMessages returns the last n records with Kind == KindUser, in
-// chronological order. Bot replies and system records are filtered out per
-// spec. Malformed lines are skipped with a best-effort tolerance.
+// chronological order. Bot replies and system records are filtered out per spec.
 func (s *Store) TailUserMessages(platform, threadID string, n int) ([]Record, error) {
-	if n <= 0 {
-		return nil, nil
-	}
-	path := filepath.Join(s.ThreadDir(platform, threadID), "transcript.jsonl")
-	f, err := os.Open(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-	// For v0.1 just stream linearly; transcripts are small. A future tail-from-end
-	// optimization is straightforward when files grow.
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	var all []Record
-	for sc.Scan() {
-		var r Record
-		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
-			continue
-		}
-		if r.Kind == KindUser {
-			all = append(all, r)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	if len(all) > n {
-		all = all[len(all)-n:]
-	}
-	return all, nil
+	return s.tail(platform, threadID, n, func(r Record) bool { return r.Kind == KindUser })
 }
 
 // TailAll returns the last n records of any kind. Used by the web UI thread
 // peek view.
 func (s *Store) TailAll(platform, threadID string, n int) ([]Record, error) {
+	return s.tail(platform, threadID, n, func(Record) bool { return true })
+}
+
+// tail reads every record from the thread's transcript, keeps those matching
+// keep, and returns the last n in chronological order.
+//
+// Robustness matters here: this runs on every trigger, and a single corrupt or
+// oversized line must never crash the turn. We use a bufio.Reader (not a
+// Scanner with a fixed max-token cap), so an arbitrarily long line is read
+// whole rather than poisoning the read with bufio.ErrTooLong; malformed JSON is
+// skipped. (For v0.1 the whole file is streamed linearly; transcripts are small.
+// A tail-from-end optimization is straightforward when files grow.)
+func (s *Store) tail(platform, threadID string, n int, keep func(Record) bool) ([]Record, error) {
 	if n <= 0 {
 		return nil, nil
 	}
@@ -154,18 +135,22 @@ func (s *Store) TailAll(platform, threadID string, n int) ([]Record, error) {
 		return nil, err
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	br := bufio.NewReader(f)
 	var all []Record
-	for sc.Scan() {
-		var r Record
-		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
-			continue
+	for {
+		line, rerr := br.ReadBytes('\n')
+		if len(line) > 0 {
+			var r Record
+			if json.Unmarshal(line, &r) == nil && keep(r) {
+				all = append(all, r)
+			}
 		}
-		all = append(all, r)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
+		if rerr != nil {
+			if rerr == io.EOF {
+				break
+			}
+			return nil, rerr
+		}
 	}
 	if len(all) > n {
 		all = all[len(all)-n:]

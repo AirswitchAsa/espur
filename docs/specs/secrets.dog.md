@@ -8,8 +8,8 @@ Espur stores credentials that an attacker with read access to `data/espur.db` mu
 
 **At rest.**
 
-- Every credential is stored as a single age-encrypted blob in SQLite, keyed by `(scope, id)` where `scope` is e.g. `vendor`, `adapter`, `oauth`, and `id` identifies the specific credential (vendor id, platform id, etc.).
-- The SQLite row also carries non-secret metadata in plaintext columns: created/updated timestamps, a credential `kind` (`byo_key`, `oauth`, `platform_token`, ...), and a short `status` flag (`set` / `expired` / `revoked`).
+- Every credential is stored as a single age-encrypted blob in SQLite, keyed by `(scope, id)` where `scope` is e.g. `vendor`, `connection`, and `id` identifies the specific credential (vendor id, connection id, etc.).
+- The SQLite row also carries non-secret metadata in plaintext columns: created/updated timestamps, a credential `kind` (`byo_key`, `oauth`, `platform_token`, `platform_session`, ...), and a short `status` flag. Statuses in use: `set` (a value is stored), `missing` (none yet), `pending` / `linked` (OAuth-aware states), `expired` / `revoked`.
 - The credential **value** itself (api key, OAuth token bundle, platform token) is never present in plaintext columns, log lines, web UI HTML, or process memory dumps for longer than the lifetime of a single use.
 
 **Credential model — one secret, name aliases.**

@@ -245,7 +245,13 @@ func (p *Pool) Run(ctx context.Context, workDir, userMsg string, timeout time.Du
 					"event", obs.VendorRecovered,
 					"vendor_id", v.VendorID, "prior_streak", pen.FailureStreak)
 			}
-			_ = p.db.PutPenalty(ctx, applySuccess(pen, p.now()))
+			// Conditional clear: a concurrent attempt may have auth-locked this
+			// vendor after we read it as eligible; a stale success must not undo
+			// that lock. See store.ClearPenaltyOnSuccess.
+			if err := p.db.ClearPenaltyOnSuccess(ctx, v.VendorID, p.now()); err != nil {
+				p.logger.Warn("clear penalty on success failed",
+					"vendor_id", v.VendorID, "err", err.Error())
+			}
 			att.Class = ClassNone
 			res.Attempts = append(res.Attempts, att)
 			res.Outcome = OutcomeSuccess

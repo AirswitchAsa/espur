@@ -431,7 +431,7 @@ func TestInvoke_Fake_Timeout(t *testing.T) {
 
 func TestMsgAccumulator_EmitsOncePerMessage(t *testing.T) {
 	var got []string
-	a := newMsgAccumulator(func(s string) { got = append(got, s) })
+	a := newMsgAccumulator(func(s string) { got = append(got, s) }, nil) // nil lossy = healthy stream
 	// m1: two parts, last-wins on the first part id.
 	a.handle(ev("message.part.updated", part("m1", "p1", "par")), new(json.RawMessage))
 	a.handle(ev("message.part.updated", part("m1", "p1", "partial")), new(json.RawMessage))
@@ -449,6 +449,31 @@ func TestMsgAccumulator_EmitsOncePerMessage(t *testing.T) {
 	}
 	if a.count() != 2 {
 		t.Fatalf("count=%d", a.count())
+	}
+}
+
+// TestMsgAccumulator_LossyDefersToReconcile is the regression for the HIGH bug:
+// a dropped part update truncates the live-assembled text, so when the stream is
+// lossy the live completion must NOT emit (which would post truncated text and
+// mark the message done so reconcile no-ops). Instead the reconcile delivers the
+// full authoritative text.
+func TestMsgAccumulator_LossyDefersToReconcile(t *testing.T) {
+	var got []string
+	streamLossy := true
+	a := newMsgAccumulator(func(s string) { got = append(got, s) }, func() bool { return streamLossy })
+
+	// A part update for m1's tail was "dropped": we only saw "Hello" before the
+	// completion. On a lossy stream, completion must emit nothing.
+	a.handle(ev("message.part.updated", part("m1", "p1", "Hello")), new(json.RawMessage))
+	a.handle(completed("m1"), new(json.RawMessage))
+	if len(got) != 0 {
+		t.Fatalf("lossy completion should not emit live, got %v", got)
+	}
+	// Reconcile delivers the authoritative full text.
+	a.emitText("m1", "Hello, world — the complete answer")
+	want := []string{"Hello, world — the complete answer"}
+	if !equalStrings(got, want) {
+		t.Fatalf("emitted=%v want=%v", got, want)
 	}
 }
 

@@ -63,7 +63,7 @@ Both variants ride the same channel. Ordering inside the channel reflects the or
 
 - *Inbound — malformed payload / bad signature.* Adapter returns the platform's expected HTTP error, logs, emits no event. Bodies are never logged; ids and sizes may be.
 - *Inbound — bot's own echo.* Normalizer drops silently.
-- *Inbound — channel backpressure.* Drop with warn log. Repeated backpressure within a short window emits `Disconnected{Cause="downstream backpressure"}` for operator visibility; transport stays up.
+- *Inbound — channel backpressure.* When an emit blocks for >1s the event is dropped and the adapter emits `Disconnected{Cause="downstream backpressure"}` for operator visibility; transport stays up.
 - *Transport — transient drop.* Reconnect loop. `Reconnecting` events per attempt. User-invisible.
 - *Transport — reconnect budget exhausted.* `Disconnected` (terminal), start loop exits, `Healthy()=false`. Operator action required.
 - *Transport — hard auth failure.* `AuthRevoked` (terminal). Distinct from `Disconnected` so the web UI can show "needs reconfigure" vs. "platform unreachable".
@@ -95,7 +95,7 @@ The WeChat adapter (`internal/adapter/wechat/`) talks to Tencent's **personal-ac
 
 **Transport — pure HTTP/JSON, no gateway socket.**
 
-- **Login.** QR-code scan → `bot_token`. The SDK's `LoginWithQR` fetches a QR and surfaces it through an `OnQRCode(imgContent)` callback. The payload is the **QR image content** (`qrcode_img_content`), *not* a `login.weixin.qq.com/qrcode/<uuid>` URL as in the old protocol. The operator scans it from the WeChat mobile client; the SDK polls scan status (`wait`/`scaned`/`confirmed`/`expired`) until connected, then returns `{Connected, BotToken, BotID, UserID, BaseURL}`.
+- **Login.** QR-code scan → `bot_token`. The SDK's `LoginWithQR` fetches a QR and surfaces it through an `OnQRCode(imgContent)` callback. The `qrcode_img_content` payload is the **string the QR encodes** (a URL the WeChat mobile client opens), *not* pre-rendered image bytes — espur renders it into a terminal QR (`WriteLoginQR`) and also prints the raw string as a scan-failure fallback. (It is the iLink login payload, distinct from the old protocol's `login.weixin.qq.com/qrcode/<uuid>` URL.) The operator scans it from the WeChat mobile client; the SDK polls scan status (`wait`/`scaned`/`confirmed`/`expired`) until connected, then returns `{Connected, BotToken, BotID, UserID, BaseURL}`.
 - **Inbound.** Long-poll (`getUpdates`). The SDK's `Monitor(ctx, handler, opts)` runs the poll loop, auto-retry/backoff, and a server-driven dynamic timeout. Each `WeixinMessage` carries `FromUserID`, optional `GroupID`, `ContextToken`, `MessageType` (user vs. bot), and an `ItemList` of typed content items. `ilink.ExtractText` collapses text + quoted-reply + voice-transcription items into a single body string.
 - **Outbound.** Reply-only, DM only. `SendText(ctx, toUserID, text, contextToken)`. The SDK has no persistent socket — `Post` is a single HTTP round-trip per chunk.
 
@@ -111,7 +111,7 @@ The WeChat adapter (`internal/adapter/wechat/`) talks to Tencent's **personal-ac
 
 **Persistence.** Replaces the old `openwechat` hot-reload blob. The adapter persists `bot_token`, `bot_id`, `user_id`, the connected `base_url`, and the `getUpdates` cursor (`buf`) as one JSON session blob, written through an injected session store rather than a hard-coded path. A web-managed connection backs that store with the encrypted credentials table (scope `connection`), so the secret never lands on disk in plaintext; the standalone `cmd/wechat-login` helper backs it with a `data/wechat-session.json` file (mode 0600, atomic write) for headless first-login. On boot: if a saved `bot_token` exists, the QR step is skipped, the saved `base_url` is restored, and `Monitor` resumes from `InitialBuf` equal to the saved cursor; `OnBufUpdate` persists the cursor as it advances.
 
-**Lifecycle.** `Connected` after a successful login/resume. `AuthRevoked` when the server reports session expiry (`errcode -14`, surfaced via `OnSessionExpired`); on that event the adapter wipes the persisted token so the next boot forces a fresh QR scan. `Disconnected` on an unexpected `Monitor` exit. There is no gateway heartbeat, so `Healthy()` reflects the login/poll state rather than a socket.
+**Lifecycle.** `Connected` after a successful login/resume. `AuthRevoked` when the server reports session expiry (`errcode -14`, surfaced via `OnSessionExpired`); on that event the adapter wipes the persisted token so the next boot forces a fresh QR scan **and cancels `Monitor` so the run goroutine exits promptly** instead of letting the SDK sleep and retry on a dead session for up to an hour. `Disconnected` on an unexpected `Monitor` exit. There is no gateway heartbeat, so `Healthy()` reflects the login/poll state rather than a socket. The run goroutine recovers panics (in login, `Monitor`, or the message handler) so a single bad message can't crash the process; the per-message handler recovers independently so one bad message doesn't tear down the poll loop.
 
 ## Outcome
 
@@ -119,8 +119,9 @@ Each enabled connection has exactly one running `Adapter` whose `Start`-returned
 
 ## Notes
 
-- Decided: inbound channel buffer is 16 and the backpressure-drop threshold is >1s blocked (after which the adapter surfaces a `Disconnected{cause="downstream backpressure"}`). May be tuned after real Discord-load testing.
-- TODO(decision): per-platform outbound retry constants (3 attempts, 1s/3s/9s) — confirm before Discord adapter lands.
+- Decided: inbound channel buffer is 16 and the backpressure-drop threshold is >1s blocked. A single sustained (>1s) block surfaces a `Disconnected{cause="downstream backpressure"}` (both adapters fire on the first such block, not only on repeats). May be tuned after real Discord-load testing.
+- Decided & implemented: per-platform outbound retry is 3 attempts with 1s/3s/9s backoff on transient send errors (a thread-gone error is terminal, not retried). Discord's library handles HTTP 429/`Retry-After` internally via its rate limiter, so 429 rarely surfaces to the adapter.
+- Discord lifecycle: a transient gateway drop maps to `Reconnecting` (discordgo auto-reconnects under the adapter); a successful resume re-emits `Connected` (via the `Resumed` handler, since `Ready` only fires on a fresh identify). `Disconnected` is reserved for backpressure.
 - TODO(decision): per-platform freshness window for `Healthy()` (Discord gateway heartbeat ack window ≈ 60s; pin per adapter, not as a global constant).
 - Known minor gap: if Espur is shutting down between `opencode` success and `Post` completion, the user's trigger is in the dedup table but no reply was sent. On next boot the user's resend would be deduped. Acceptable for v0.1; logged at warn so the operator can see it. Revisit if it bites in practice.
 - The set of platforms supported in v0.1 is Discord first, WeChat second. The interface is shaped to absorb Slack / Matrix / Telegram without changes.

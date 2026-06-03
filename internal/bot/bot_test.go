@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -89,6 +90,51 @@ func newCore(t *testing.T, inv vendor.Invoker) (*Core, *fakeAdapter, *store.DB) 
 	fa := &fakeAdapter{done: make(chan string, 4)}
 	core.RegisterAdapter(fa)
 	return core, fa, db
+}
+
+// typingAdapter wraps fakeAdapter and additionally implements adapter.Typer so
+// the core's typing wiring can be observed.
+type typingAdapter struct {
+	*fakeAdapter
+	starts atomic.Int32
+	stops  atomic.Int32
+}
+
+func (t *typingAdapter) StartTyping(_ context.Context, _ string) func() {
+	t.starts.Add(1)
+	return func() { t.stops.Add(1) }
+}
+
+// TestBot_TypingStartedAndStopped verifies the core starts a typing indicator
+// once per trigger (for adapters implementing Typer) and stops it when the run
+// completes.
+func TestBot_TypingStartedAndStopped(t *testing.T) {
+	inv := &fakeInvoker{results: []opencode.Result{{Outcome: opencode.OutcomeSuccess, AssistantText: "pong"}}}
+	core, fa, _ := newCore(t, inv)
+	ta := &typingAdapter{fakeAdapter: fa}
+	core.RegisterAdapter(ta) // same platform key ("discord") -> replaces fa as the poster
+
+	core.Dispatch(context.Background(), adapter.Event{Message: &adapter.MessageEvent{
+		Platform: "discord", ThreadID: "ch-1", PlatformMessageID: "m-1",
+		Author: adapter.Author{Label: "alice"}, Body: "ping", Mention: true,
+	}})
+
+	<-fa.done // reply posted
+
+	deadline := time.After(time.Second)
+	for ta.stops.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("typing stop never called")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if got := ta.starts.Load(); got != 1 {
+		t.Fatalf("StartTyping calls=%d want 1", got)
+	}
+	if got := ta.stops.Load(); got != 1 {
+		t.Fatalf("typing stop calls=%d want 1", got)
+	}
 }
 
 func TestBot_HappyPath(t *testing.T) {

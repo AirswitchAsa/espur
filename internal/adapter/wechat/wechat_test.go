@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,9 +15,16 @@ import (
 
 // fakeClient is a network-free stand-in for the iLink SDK client.
 type fakeClient struct {
+	mu            sync.Mutex
 	sendTextCalls []sendTextCall
 	sendErr       error
 	baseURL       string
+
+	// typing-indicator recording (touched from the keepalive goroutine).
+	typingTicket   string // ticket GetConfig hands out (empty -> StartTyping no-ops)
+	getConfigCalls int
+	getConfigErr   error
+	typingStatuses []ilink.TypingStatus
 }
 
 type sendTextCall struct {
@@ -38,6 +46,42 @@ func (f *fakeClient) SendText(_ context.Context, to, text, token string) (string
 		return "", f.sendErr
 	}
 	return "msgid-" + to + "-" + token, nil
+}
+
+func (f *fakeClient) GetConfig(_ context.Context, _, _ string) (*ilink.GetConfigResp, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getConfigCalls++
+	if f.getConfigErr != nil {
+		return nil, f.getConfigErr
+	}
+	return &ilink.GetConfigResp{TypingTicket: f.typingTicket}, nil
+}
+
+func (f *fakeClient) SendTyping(_ context.Context, _, _ string, status ilink.TypingStatus) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.typingStatuses = append(f.typingStatuses, status)
+	return nil
+}
+
+// typingCount returns how many times SendTyping was called with the given status.
+func (f *fakeClient) typingCount(status ilink.TypingStatus) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, s := range f.typingStatuses {
+		if s == status {
+			n++
+		}
+	}
+	return n
+}
+
+func (f *fakeClient) configCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getConfigCalls
 }
 
 func (f *fakeClient) SetBaseURL(url string) { f.baseURL = url }
@@ -324,4 +368,129 @@ func TestClearAuth_WipesPersistedToken(t *testing.T) {
 	if got := a.loadSession(); got != (session{}) {
 		t.Fatalf("clearAuth should empty the session, got %+v", got)
 	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		if cond() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("condition not met within deadline")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+func newTypingAdapter(client ilinkClient) *Adapter {
+	return &Adapter{
+		client:        client,
+		threads:       map[string]string{},
+		typingTickets: map[string]string{},
+		typing:        map[string]*adapter.TypingState{},
+	}
+}
+
+// TestStartTyping_FetchesTicketFiresAndClears verifies the full lifecycle:
+// GetConfig is called once to resolve+cache a ticket, status:1 is sent, and
+// stop() sends status:2 to clear the bubble.
+func TestStartTyping_FetchesTicketFiresAndClears(t *testing.T) {
+	defer shrinkTypingRefresh(t)()
+	f := &fakeClient{typingTicket: "tk-1"}
+	a := newTypingAdapter(f)
+	a.threads["peer"] = "ctx-1"
+
+	stop := a.StartTyping(context.Background(), "peer")
+	waitFor(t, func() bool { return f.typingCount(ilink.Typing) >= 1 })
+
+	if f.configCalls() != 1 {
+		t.Fatalf("GetConfig calls=%d want 1", f.configCalls())
+	}
+	a.mu.Lock()
+	cached := a.typingTickets["peer"]
+	a.mu.Unlock()
+	if cached != "tk-1" {
+		t.Fatalf("ticket not cached: %q", cached)
+	}
+
+	stop()
+	waitFor(t, func() bool { return f.typingCount(ilink.CancelTyping) >= 1 })
+
+	a.mu.Lock()
+	_, stillTracked := a.typing["peer"]
+	stillCached := a.typingTickets["peer"]
+	a.mu.Unlock()
+	if stillTracked {
+		t.Fatal("stop() should remove the typing state")
+	}
+	if stillCached != "tk-1" {
+		t.Fatal("stop() should keep the cached ticket for reuse (valid ~24h)")
+	}
+}
+
+// TestStartTyping_NoContextTokenIsNoop verifies a thread we can't reply to never
+// triggers GetConfig or SendTyping.
+func TestStartTyping_NoContextTokenIsNoop(t *testing.T) {
+	defer shrinkTypingRefresh(t)()
+	f := &fakeClient{typingTicket: "tk-1"}
+	a := newTypingAdapter(f) // no cached context token for "stranger"
+
+	stop := a.StartTyping(context.Background(), "stranger")
+	defer stop()
+
+	// Give the goroutine time to run and bail out.
+	time.Sleep(30 * time.Millisecond)
+	if f.configCalls() != 0 {
+		t.Fatalf("GetConfig should not be called without a context token (got %d)", f.configCalls())
+	}
+	if got := f.typingCount(ilink.Typing) + f.typingCount(ilink.CancelTyping); got != 0 {
+		t.Fatalf("SendTyping should not be called without a context token (got %d)", got)
+	}
+}
+
+// TestStartTyping_EmptyTicketIsNoop verifies that if GetConfig returns no ticket
+// we don't attempt to send a typing status.
+func TestStartTyping_EmptyTicketIsNoop(t *testing.T) {
+	defer shrinkTypingRefresh(t)()
+	f := &fakeClient{typingTicket: ""} // server returns no ticket
+	a := newTypingAdapter(f)
+	a.threads["peer"] = "ctx-1"
+
+	stop := a.StartTyping(context.Background(), "peer")
+	defer stop()
+
+	waitFor(t, func() bool { return f.configCalls() == 1 })
+	time.Sleep(20 * time.Millisecond)
+	if got := f.typingCount(ilink.Typing); got != 0 {
+		t.Fatalf("no ticket -> no typing send, got %d", got)
+	}
+}
+
+// TestPost_PausesTyping verifies Post toggles the per-thread typing state so the
+// keepalive loop pauses while a message is delivered.
+func TestPost_PausesTyping(t *testing.T) {
+	f := &fakeClient{}
+	a := newTypingAdapter(f)
+	a.threads["peer"] = "ctx-1"
+	st := adapter.NewTypingState()
+	a.typing["peer"] = st
+
+	if _, err := a.Post(context.Background(), "peer", "hello"); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	if !st.Idle() {
+		t.Fatal("Post should leave the typing state idle (BeginPost/EndPost balanced)")
+	}
+}
+
+// shrinkTypingRefresh makes the keepalive cadence test-fast and returns a
+// restore func.
+func shrinkTypingRefresh(t *testing.T) func() {
+	t.Helper()
+	orig := typingRefresh
+	typingRefresh = 10 * time.Millisecond
+	return func() { typingRefresh = orig }
 }

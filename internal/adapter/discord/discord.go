@@ -26,10 +26,19 @@ type Adapter struct {
 	userID   string
 	platform string // routing key returned by Platform(); see WithPlatformKey
 
+	// typingFire triggers Discord's typing indicator on a channel. It is a field
+	// (not a direct a.session call) so tests can substitute a counter without a
+	// live session / network. Defaults in New to a.session.ChannelTyping.
+	typingFire func(threadID string)
+
 	mu      sync.Mutex
 	events  chan adapter.Event
 	healthy atomic.Bool
+	typing  map[string]*adapter.TypingState // threadID -> active typing controller
 }
+
+// compile-time: the Discord adapter shows typing indicators.
+var _ adapter.Typer = (*Adapter)(nil)
 
 // Option configures an Adapter at construction.
 type Option func(*Adapter)
@@ -58,7 +67,8 @@ func New(token string, opts ...Option) (*Adapter, error) {
 	s.Identify.Intents = discordgo.IntentsGuildMessages |
 		discordgo.IntentsDirectMessages |
 		discordgo.IntentsMessageContent
-	a := &Adapter{session: s, platform: "discord"}
+	a := &Adapter{session: s, platform: "discord", typing: make(map[string]*adapter.TypingState)}
+	a.typingFire = func(threadID string) { _ = a.session.ChannelTyping(threadID) }
 	for _, o := range opts {
 		o(a)
 	}
@@ -206,10 +216,48 @@ func normalizeBody(m *discordgo.Message, botUserID string) (string, bool) {
 // A var so tests can shrink it.
 var postBackoff = []time.Duration{1 * time.Second, 3 * time.Second, 9 * time.Second}
 
+// typingRefresh is how often we re-trigger Discord's typing indicator, which the
+// API clears after ~10s. A var so tests can shrink it.
+var typingRefresh = 8 * time.Second
+
+// StartTyping implements adapter.Typer. It fires Discord's typing indicator on
+// threadID immediately and refreshes it every typingRefresh until the returned
+// stop func is called (or ctx is cancelled), pausing while a Post to the same
+// thread is in flight (the delivered message clears the bubble on its own).
+// Discord has no explicit "stop" call — cancelling lets the indicator lapse.
+func (a *Adapter) StartTyping(ctx context.Context, threadID string) func() {
+	st := adapter.NewTypingState()
+	a.mu.Lock()
+	a.typing[threadID] = st
+	a.mu.Unlock()
+
+	tctx, cancel := context.WithCancel(ctx)
+	go adapter.RunTypingLoop(tctx, st, typingRefresh,
+		func() { a.typingFire(threadID) },
+		nil)
+
+	return func() {
+		cancel()
+		a.mu.Lock()
+		delete(a.typing, threadID)
+		a.mu.Unlock()
+	}
+}
+
 // Post implements the outbound side. The full body is split into the minimum
 // number of <=MaxChunk chunks; each chunk is posted sequentially. Returns the
 // platform-native ID of the first chunk for transcript correlation.
 func (a *Adapter) Post(ctx context.Context, threadID, body string) (string, error) {
+	// Pause any active typing indicator for this thread while we deliver: the
+	// posted message replaces the bubble, and EndPost re-fires typing afterward.
+	a.mu.Lock()
+	st := a.typing[threadID]
+	a.mu.Unlock()
+	if st != nil {
+		st.BeginPost()
+		defer st.EndPost()
+	}
+
 	chunks := chunk(body, MaxChunk)
 	if len(chunks) == 0 {
 		return "", nil

@@ -266,6 +266,16 @@ func (c *Core) HandleTrigger(ctx context.Context, m *adapter.MessageEvent) {
 		return
 	}
 
+	// Show a typing indicator for the duration of the agent run, if the adapter
+	// supports it. Best-effort and platform-managed (the adapter pauses it while
+	// each reply is posted and refreshes on its own cadence); a no-op on adapters
+	// that don't implement Typer. The deferred stop fires when this run returns.
+	stopTyping := func() {}
+	if t, ok := a.(adapter.Typer); ok {
+		stopTyping = t.StartTyping(ctx, m.ThreadID)
+	}
+	defer stopTyping()
+
 	// Progressive delivery: post each assistant message the moment opencode
 	// finishes it (see [[reply]] — one platform message per assistant message),
 	// recording each to the transcript. streamed counts how many went out so the

@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
+
+	"github.com/punny/espur/internal/adapter"
 )
 
 func TestIsThreadGone(t *testing.T) {
@@ -54,6 +58,80 @@ func TestPlatformAndHealthy(t *testing.T) {
 	}
 	if a.Healthy() {
 		t.Fatal("unstarted adapter must not be healthy")
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		if cond() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("condition not met within deadline")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// TestStartTyping_FiresPausesAndStops drives the indicator through a substituted
+// fire func (no live session): it fires immediately, suppresses fires while a
+// Post is in flight, re-fires when the Post completes, and removes the per-thread
+// state on stop.
+func TestStartTyping_FiresPausesAndStops(t *testing.T) {
+	orig := typingRefresh
+	typingRefresh = 10 * time.Millisecond
+	defer func() { typingRefresh = orig }()
+
+	a := &Adapter{typing: map[string]*adapter.TypingState{}}
+	var fires int32
+	a.typingFire = func(string) { atomic.AddInt32(&fires, 1) }
+
+	stop := a.StartTyping(context.Background(), "ch")
+	waitFor(t, func() bool { return atomic.LoadInt32(&fires) >= 1 }) // initial fire
+
+	a.mu.Lock()
+	st := a.typing["ch"]
+	a.mu.Unlock()
+	if st == nil {
+		t.Fatal("StartTyping should register a typing state for the thread")
+	}
+
+	// While a Post is in flight, the indicator must not refresh.
+	st.BeginPost()
+	base := atomic.LoadInt32(&fires)
+	time.Sleep(50 * time.Millisecond) // several refresh intervals
+	if got := atomic.LoadInt32(&fires); got != base {
+		t.Fatalf("typing fired %d times while a Post was in flight (want %d)", got, base)
+	}
+
+	// Completing the Post re-fires promptly.
+	st.EndPost()
+	waitFor(t, func() bool { return atomic.LoadInt32(&fires) > base })
+
+	stop()
+	a.mu.Lock()
+	_, tracked := a.typing["ch"]
+	a.mu.Unlock()
+	if tracked {
+		t.Fatal("stop() should remove the typing state")
+	}
+}
+
+// TestPost_PausesTyping verifies Post toggles the typing state (BeginPost/EndPost
+// balanced) using the empty-body short-circuit so no session call is made.
+func TestPost_PausesTyping(t *testing.T) {
+	a := &Adapter{typing: map[string]*adapter.TypingState{}}
+	st := adapter.NewTypingState()
+	a.typing["ch"] = st
+
+	if _, err := a.Post(context.Background(), "ch", ""); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	if !st.Idle() {
+		t.Fatal("Post should leave the typing state idle (BeginPost/EndPost balanced)")
 	}
 }
 

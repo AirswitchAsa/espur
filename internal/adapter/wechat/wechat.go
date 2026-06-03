@@ -51,6 +51,8 @@ type ilinkClient interface {
 	LoginWithQR(ctx context.Context, cb *ilink.LoginCallbacks) (*ilink.LoginResult, error)
 	Monitor(ctx context.Context, handler ilink.MessageHandler, opts *ilink.MonitorOptions) error
 	SendText(ctx context.Context, to, text, contextToken string) (string, error)
+	GetConfig(ctx context.Context, userID, contextToken string) (*ilink.GetConfigResp, error)
+	SendTyping(ctx context.Context, userID, typingTicket string, status ilink.TypingStatus) error
 	SetBaseURL(url string)
 }
 
@@ -77,14 +79,19 @@ type Adapter struct {
 	// default (emit a structured line on stdout). Injectable for tests.
 	qrCallback func(imgContent string)
 
-	mu      sync.Mutex
-	client  ilinkClient
-	threads map[string]string // threadID (FromUserID) -> latest context_token
-	sess    session
+	mu            sync.Mutex
+	client        ilinkClient
+	threads       map[string]string               // threadID (FromUserID) -> latest context_token
+	typingTickets map[string]string               // threadID -> typing_ticket (valid ~24h, cached)
+	typing        map[string]*adapter.TypingState // threadID -> active typing controller
+	sess          session
 
 	events  chan adapter.Event
 	healthy atomic.Bool
 }
+
+// compile-time: the WeChat adapter shows typing indicators.
+var _ adapter.Typer = (*Adapter)(nil)
 
 // Option configures an Adapter at construction.
 type Option func(*Adapter)
@@ -122,9 +129,11 @@ func New(store SessionStore, opts ...Option) (*Adapter, error) {
 		return nil, errors.New("wechat: session store is required")
 	}
 	a := &Adapter{
-		store:    store,
-		platform: "wechat",
-		threads:  make(map[string]string),
+		store:         store,
+		platform:      "wechat",
+		threads:       make(map[string]string),
+		typingTickets: make(map[string]string),
+		typing:        make(map[string]*adapter.TypingState),
 	}
 	for _, o := range opts {
 		o(a)
@@ -390,6 +399,68 @@ func normalizeBody(content string) string {
 	return strings.TrimSpace(cleaned)
 }
 
+// typingRefresh is the keepalive cadence for WeChat's typing bubble. The
+// protocol asks for status:1 (Typing) roughly every 5s during long operations.
+// A var so tests can shrink it.
+var typingRefresh = 5 * time.Second
+
+// typingClearTimeout bounds the final CancelTyping sent when typing stops; the
+// keepalive context is already cancelled at that point so the clear runs on a
+// short detached context.
+var typingClearTimeout = 2 * time.Second
+
+// StartTyping implements adapter.Typer for WeChat. It resolves a typing_ticket
+// (via GetConfig, cached per thread — valid ~24h) and sends status:1 (Typing),
+// refreshing every typingRefresh until the returned stop func is called (or ctx
+// is cancelled), then sends status:2 (CancelTyping) to clear the bubble. Typing
+// pauses while a Post to the same thread is in flight. All network work happens
+// on the spawned goroutine so StartTyping never blocks the caller. A thread with
+// no cached context token (we can only reply, never initiate) is a no-op.
+func (a *Adapter) StartTyping(ctx context.Context, threadID string) func() {
+	st := adapter.NewTypingState()
+	a.mu.Lock()
+	a.typing[threadID] = st
+	a.mu.Unlock()
+
+	tctx, cancel := context.WithCancel(ctx)
+	go func() {
+		a.mu.Lock()
+		client := a.client
+		token, ok := a.threads[threadID]
+		ticket := a.typingTickets[threadID]
+		a.mu.Unlock()
+		if client == nil || !ok {
+			return // no context token: we can't type where we can't reply
+		}
+		if ticket == "" {
+			resp, err := client.GetConfig(tctx, threadID, token)
+			if err != nil || resp == nil || resp.TypingTicket == "" {
+				return // best-effort: couldn't get a ticket, skip typing
+			}
+			ticket = resp.TypingTicket
+			a.mu.Lock()
+			a.typingTickets[threadID] = ticket
+			a.mu.Unlock()
+		}
+		adapter.RunTypingLoop(tctx, st, typingRefresh,
+			func() { _ = client.SendTyping(tctx, threadID, ticket, ilink.Typing) },
+			func() {
+				sctx, c := context.WithTimeout(context.Background(), typingClearTimeout)
+				defer c()
+				_ = client.SendTyping(sctx, threadID, ticket, ilink.CancelTyping)
+			})
+	}()
+
+	return func() {
+		cancel()
+		a.mu.Lock()
+		delete(a.typing, threadID)
+		a.mu.Unlock()
+		// typingTickets is intentionally kept: the ticket stays valid ~24h, so the
+		// next run on this thread reuses it instead of calling GetConfig again.
+	}
+}
+
 // Post sends body to the WeChat thread identified by threadID. It splits into
 // MaxChunk-sized chunks via textchunk.Split, echoes the cached context_token,
 // and returns the first chunk's id for transcript correlation. A thread with no
@@ -398,7 +469,14 @@ func (a *Adapter) Post(ctx context.Context, threadID, body string) (string, erro
 	a.mu.Lock()
 	client := a.client
 	token, ok := a.threads[threadID]
+	st := a.typing[threadID]
 	a.mu.Unlock()
+	// Pause any active typing indicator while we deliver: the message replaces
+	// the bubble, and EndPost re-fires typing afterward.
+	if st != nil {
+		st.BeginPost()
+		defer st.EndPost()
+	}
 	if client == nil {
 		return "", errors.New("wechat: not started")
 	}

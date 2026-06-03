@@ -114,23 +114,26 @@ func Classify(stdout, stderr string) FailureClass {
 	return ClassNone
 }
 
-// errorEnvelope distils opencode's NDJSON stdout down to just its error-bearing
-// content. `opencode run --format json` emits one JSON event per line; a
+// errorEnvelope distils a stream of JSON event lines down to just its
+// error-bearing content. The opencode invoker now classifies from the
+// synthesized failure string it passes as `stderr` (a structured session.error /
+// non-2xx body), so in practice `stdout` is empty here; this defensively keeps
+// the old NDJSON behaviour for any caller that does pass event lines. A
 // provider/runtime failure surfaces as an event carrying a top-level `error`
-// object (observed against opencode 1.15.x):
+// object:
 //
 //	{"type":"error","sessionID":"...","error":{"name":"...","data":{"message":"...","statusCode":401}}}
 //
 // We keep only those error objects. Normal events (`text`, `tool`, `step_*`)
 // hold the assistant answer and tool results — including any HTTP errors a tool
 // hit while crawling — and are dropped so they can't trip the auth/rate-limit
-// phrase match. Lines that don't parse as JSON are kept verbatim: opencode's
-// own NDJSON is always valid, so a non-JSON line means abnormal output (a panic
-// or fatal log) worth classifying, and tool/web content never appears raw.
+// phrase match. Lines that don't parse as JSON are kept verbatim: a non-JSON
+// line means abnormal output (a panic or fatal log) worth classifying, and
+// tool/web content never appears raw.
 func errorEnvelope(stdout string) string {
 	var b strings.Builder
 	sc := bufio.NewScanner(strings.NewReader(stdout))
-	// Match extractSessionID's bound: a single event line can be large.
+	// A single event line can be large.
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())

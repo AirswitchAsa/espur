@@ -52,8 +52,11 @@ func TestInvoke_SuccessOneVendor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	srv := NewServers("", nil)
+	defer srv.Close()
+
 	start := time.Now()
-	res, err := Invoke(ctx, req)
+	res, err := srv.Invoke(ctx, req)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("Invoke error: %v\nstderr:\n%s", err, res.Stderr)
@@ -99,7 +102,10 @@ func TestInvoke_TimeoutKillsChild(t *testing.T) {
 	hardLimit := req.Timeout + DefaultKillGrace + 10*time.Second
 	deadline := time.Now().Add(hardLimit)
 
-	res, err := Invoke(ctx, req)
+	srv := NewServers("", nil)
+	defer srv.Close()
+
+	res, err := srv.Invoke(ctx, req)
 	if err != nil {
 		t.Fatalf("Invoke error: %v", err)
 	}

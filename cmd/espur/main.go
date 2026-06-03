@@ -227,6 +227,11 @@ func run() (int, error) {
 	}
 	logger.Info("adapters shutdown complete", "event", obs.ShutdownAdapter, "count", len(conns))
 
+	// Kill the per-vendor `opencode serve` children now that invocations have
+	// drained. Safe after drain; before, it would yank servers out from under
+	// in-flight turns.
+	pool.Close()
+
 	if err := db.Checkpoint(context.Background()); err != nil {
 		logger.Warn("wal checkpoint failed (db still consistent)",
 			"event", obs.ShutdownStore, "err", err.Error())

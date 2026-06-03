@@ -6,82 +6,81 @@ A `Trigger` is at the head of its thread queue, the assembled user message exist
 
 ## Description
 
-For each invocation attempt, Espur shells out to the `opencode` CLI as a child process. The invocation is **stateless** — there is no session reuse, no `--continue`, no shared opencode daemon. Every trigger is its own fresh process.
+Espur drives the `opencode` agent through its **headless HTTP server** (`opencode serve`) — the same API surface opencode's own TUI uses. Espur runs **one long-lived server per vendor**, started lazily on first use and reused across turns. Each turn is still **stateless**: Espur creates a fresh session, sends the prompt, and never reuses a session or uses `--continue`. The server is the integration surface because the alternative — scraping `opencode run --format json` stdout — is a best-effort stream that intermittently drops the final message's text event and offered no reliable way to stream intermediate messages.
 
-**Command shape**
+**Why a server per vendor (not one shared, not one per turn)**
+
+- *Per vendor, not shared:* each server's process env carries **only that vendor's credentials** (see Environment). A prompt-injected run in one vendor's session therefore can never read another vendor's key — the same credential-isolation property the old per-invocation child had. A single shared server holding every vendor's key would break it.
+- *Persistent, not per-turn:* the server startup cost (low single-digit seconds) is paid once per vendor, not on every turn. There is no background supervisor; health is gated when a turn acquires the server — a dead or never-healthy server is killed and respawned synchronously on the next turn. Servers are killed on shutdown after invocations drain (see [[shutdown]]).
+
+**Server command**
 
 ```
-opencode run --format json --model <vendor-model-id>
+opencode serve --port <auto> --hostname 127.0.0.1 --log-level INFO
 ```
 
-- `--format json` is required; Espur parses opencode's reply from the JSON envelope on stdout.
-- `--model <vendor-model-id>` is taken from the currently-attempted vendor entry in the vendor pool (e.g. `anthropic/claude-sonnet-...`, `openai/gpt-...`, `google/gemini-...`).
-- The assembled user message (see [[context-assembly]]) is delivered as opencode's user prompt. The mechanism may be stdin or a positional arg, whichever `opencode run` documents — but it is always the same composite string built by context assembly.
+- The port is an OS-assigned free loopback port; the server is never exposed off `127.0.0.1`.
+- `--model` is **not** a server flag. The model is chosen per request: Espur splits the vendor's model id `"<provider>/<model>"` on the first slash into `{providerID, modelID}` (e.g. `deepseek/deepseek-v4-pro` → `deepseek`, `deepseek-v4-pro`).
 
-**Working directory**
+**Per-turn request flow**
 
-- Each thread has a dedicated working directory at `data/threads/<thread_id>/`.
-- The child process's `cwd` is set to that directory.
-- The directory is created on first trigger for the thread (see [[memory-seed]]).
-- opencode is given full filesystem tool access scoped to that cwd. Espur does not constrain individual tool calls.
+1. `POST /session?directory=<thread-cwd>` — the working directory is a per-request query param, so one server serves every thread's cwd. Each thread's dir is `data/threads/<thread_id>/`, created on first trigger (see [[memory-seed]]); opencode has full filesystem tool access scoped to it.
+2. Subscribe to the session's events on the server's shared SSE stream (`GET /event`).
+3. `POST /session/<id>/message` with the model and the assembled user message (see [[context-assembly]]) as a single text part. This call is **synchronous**: it blocks until the turn goes idle (through any tool calls) and returns the authoritative final assistant message `{info, parts}`.
 
 **Environment**
 
-- The minimal env passed to the child: `PATH`, `HOME`, `TMPDIR`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, and the vendor's credentials in the form opencode expects.
+- The minimal env passed to each server: `PATH`, `HOME`, `TMPDIR`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, plus the vendor's credentials in the form opencode expects.
   - For BYO-key vendors that is one or more API-key env vars (e.g. `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`).
-  - For OAuth vendors, **no provider-specific env var is injected**. The credential lives in opencode's auth file under `$XDG_DATA_HOME/opencode/auth.json` and is read by opencode itself — see [[oauth]] for the delegation model.
-- Espur does **not** leak its own master key or unrelated vendor credentials into the child env. Only the credentials of the vendor currently being attempted are exposed.
+  - For OAuth vendors, **no provider-specific env var is injected**. The credential lives in opencode's auth file under `$XDG_DATA_HOME/opencode/auth.json` and is read by opencode itself — see [[oauth]].
+- Espur does **not** leak its own master key or unrelated vendor credentials into a server's env. Only the credentials of the vendor that owns the server are exposed.
+- Operators may forward extra env var names via `ESPUR_OPENCODE_ENV_PASSTHROUGH` (comma-separated) for keys consumed by user-installed skills.
 
 **Timeout**
 
 - A wall-clock timeout per invocation. Default **120 seconds**.
-- On timeout, the child is killed (`SIGTERM` then `SIGKILL` after a grace period of a few seconds), the attempt is recorded as a timeout, and the timeout reply behavior takes over (see [[reply]]).
-- A timeout is **not** counted as a vendor failure — it does not put the vendor in the penalty box and does not cause fallthrough to the next vendor.
+- On timeout, Espur calls `POST /session/<id>/abort` to cancel the turn; the attempt is recorded as a timeout and the timeout reply behavior takes over (see [[reply]]). Any messages already streamed stand.
+- A timeout is **not** counted as a vendor failure — it does not penalize the vendor and does not cause fallthrough.
 
-**Output parsing — streamed, with an export backstop**
+**Output — streamed over SSE, reconciled against the authoritative list**
 
-Stdout is opencode's NDJSON event stream, read **line-by-line as the child writes it** (not buffered until exit). Espur reconstructs assistant messages from the events and emits each one the moment it completes, so [[reply]] can post it while the run is still going:
+The SSE event bus (`GET /event`) is the real-time channel. Espur reconstructs each assistant message from the events and emits it the moment it completes, so [[reply]] can post it while the run is still going:
 
-- `step_start` announces a new assistant message (a new `messageID`); `sessionID` is read from the first event that carries it.
-- `type=text` events carry the message's text parts. A part streams as repeated events for the same part id (growing text), so text is keyed by part id with last-value-wins and concatenated in first-seen order.
-- `step_finish` is the per-message boundary: when it arrives for a message that accumulated non-empty text, that message is emitted. Tool-only and empty messages emit nothing (they are working state, not a reply).
+- `message.part.updated` carries a message's text part as it grows (repeated events for the same part id; last-value-wins, concatenated in first-seen order, keyed by `messageID`).
+- `message.updated` with `info.role == "assistant"` and `info.time.completed` set is the **per-message boundary**: that message's accumulated text, if non-empty, is emitted. Tool-only and empty messages emit nothing (they are working state, not a reply).
+- `session.idle` marks the end of the turn; `session.error` carries a structured failure.
 
-After the child exits, Espur runs `opencode export <sessionID>` **only as a backstop**, to recover a final message whose trailing `type=text` event opencode dropped from stdout (observed intermittently, opencode 1.15.11–1.15.13). The backstop is consulted only when stdout left a gap — no message streamed at all, or the last `messageID` stdout announced never received its text. Crucially:
-
-- The export retry is keyed on that **final messageID**: it waits until the export actually contains that message, rather than accepting the first non-empty read. A fresh `opencode export` right after a run can return a *mid-turn snapshot* — the session is visible but its final message hasn't been written yet (an internal SQLite-visibility delay that grows with session size, observed 4–7s on large turns). Accepting that snapshot would serve an earlier preamble as the answer. Waiting for the announced final messageID prevents that.
-- Recovered messages stdout didn't already deliver are emitted in order, after the streamed ones, so the answer arrives last.
+After the turn ends, Espur **reconciles** against the authoritative message list (`GET /session/<id>/message`) and emits, in order, any assistant text message the live stream did not already deliver. This replaces the old `opencode export` backstop entirely: the data is already complete in the server when the turn is idle, so there is **no settle race** to retry around. (If that read fails, Espur falls back to the synchronous response's final message.)
 
 Other rules:
 
-- Stderr is captured for diagnostics and used to classify failures (rate limit, quota, 5xx) per [[vendor-pool]].
-- A non-zero exit code with no recoverable session is treated as a crash; see [[reply]] for the user-facing message.
-- A zero exit code that yields no usable assistant text from either source is also a crash (`no_assistant_text`); a hard export failure when the stream produced nothing is `export_failed`.
+- Failure detail — a structured `session.error`, a non-2xx send, or an error on the final message — is synthesized into a single string and classified for fallthrough by [[vendor-pool]] (it carries the provider's `statusCode`/message).
+- A turn that yields no usable assistant text and no error is a crash (`no_assistant_text`). A server that can't be started or a session that can't be created is a crash (`server_unavailable` / `session_create_failed`).
 - Once a vendor attempt has streamed ≥1 assistant message, a later failure can **not** fall through to another vendor — re-running would replay a second turn over the posted output. Fallthrough applies only to failures that surface before any output (the common auth / rate-limit / 5xx case). See [[vendor-pool]].
 
 **Vendor fallthrough**
 
-- If the invocation's stderr/exit classification matches a fallthrough pattern (see [[vendor-pool]]), Espur immediately re-invokes opencode with the next eligible vendor's `--model` and credentials. The user message and `cwd` are unchanged.
-- The new attempt uses a **fresh process** — there is no resumption of opencode state across vendors.
+- If the failure classification matches a fallthrough pattern (see [[vendor-pool]]), Espur immediately retries the turn against the next eligible vendor — i.e. its server, a fresh session, the same user message and cwd. There is no opencode state carried across vendors.
 
 ## Outcome
 
-For each accepted trigger, exactly one of the following terminal outcomes is produced:
+For each accepted trigger, exactly one terminal outcome is produced:
 
-- **Success** — one vendor returned a parseable assistant reply within timeout. The reply text is handed to [[reply]] for posting.
-- **Timeout** — wall clock exceeded; child killed. Hand off to timeout reply path.
-- **All drained** — every vendor in the pool was either attempted-and-failed or already in the penalty box. Hand off to all-drained reply path.
-- **Crash** — non-classifiable error (e.g. opencode binary missing, malformed JSON, panic). Hand off to error reply path with a request ID.
+- **Success** — one vendor returned a parseable assistant reply within timeout. The reply text(s) are handed to [[reply]].
+- **Timeout** — wall clock exceeded; turn aborted. Hand off to timeout reply path.
+- **All drained** — every vendor was either attempted-and-failed or already in the penalty box.
+- **Crash** — non-classifiable error. Hand off to error reply path with a request ID.
 
 Side effects of a successful invocation:
 
-- opencode may have created or modified files under the thread's working directory (`AGENTS.md`, `fact_<slug>.md`, etc.). Those changes are kept; Espur does not clean them.
-- The transcript is appended to with both the user trigger (already done at enqueue) and the bot's eventual reply (done by [[reply]]).
+- opencode may have created or modified files under the thread's working directory (`AGENTS.md`, `fact_<slug>.md`, etc.). Those changes are kept.
+- The transcript is appended with both the user trigger (at enqueue) and the bot's reply (by [[reply]]).
 
 ## Notes
 
-- The child process must inherit no TTY; opencode should detect non-interactive mode from `--format json`.
-- The user message is delivered as a **single positional `message` argument** to `opencode run`. `opencode run` documents `[message..]` (a variadic positional). A single argument is sufficient; opencode joins multiple positional args with spaces, which would corrupt the wrapper tags from [[context-assembly]]. Pinned experimentally against opencode 1.15.11.
-- The grace period between SIGTERM and SIGKILL on timeout is **5 seconds**. Pinned.
-- Global concurrency cap on opencode children: **4**, overridable via `ESPUR_OPENCODE_MAX_CONCURRENT` (set to `0` to disable). Implemented as a buffered semaphore in `internal/vendor/pool.Run`; per-thread serialization (the per-thread queue's job) composes with it. Per-vendor penalty races across concurrent runs are benign by design — see [[vendor-pool]].
-- opencode persists every invocation as a session under `~/.local/share/opencode/` (or platform equivalent). Sessions accumulate across invocations and are visible via `opencode session list`. Espur does not currently prune them — to be revisited when this becomes a disk-space concern.
-- The vendor-attempt loop is the only retry loop. Within a single vendor attempt, there are no transparent retries by Espur — if opencode itself retries internally that is opaque to us.
+- The user message is delivered as a single text **part** in the prompt body — not a positional CLI arg — so the composite wrapper tags from [[context-assembly]] are never re-split.
+- Per-vendor servers and their sessions accumulate state in opencode's shared store under `$XDG_DATA_HOME/opencode/`. Espur does not currently prune sessions — to be revisited when disk becomes a concern.
+- The vendor-attempt loop is the only retry loop. Within a single attempt there are no transparent retries by Espur.
+- Pinned experimentally against opencode 1.15.13: the server emits `message.part.updated` / `message.updated` / `session.idle` (not the `session.next.text.*` family); `POST /session/<id>/message` blocks through tool calls and returns the final message; `directory` is a query param on session create and prompt endpoints.
+- The grace period between SIGTERM and SIGKILL when killing a server process group is **5 seconds**.
+- Global concurrency cap on concurrent turns: **4**, overridable via `ESPUR_OPENCODE_MAX_CONCURRENT` (`0` disables). Implemented as a buffered semaphore in `internal/vendor/pool.Run`; per-thread serialization composes with it.

@@ -1,17 +1,15 @@
-// Package opencode invokes the `opencode` CLI as a stateless child process per
-// trigger. See docs/specs/opencode-invoke.dog.md for the behavioral contract.
+// Package opencode drives the `opencode` agent through its headless HTTP server
+// (`opencode serve`) — the same API surface opencode's own TUI uses. espur runs
+// one server per vendor (see server.go), sends each turn as a synchronous prompt,
+// and streams the assistant's messages live over the server's SSE event bus.
+// See docs/specs/opencode-invoke.dog.md for the behavioral contract.
 package opencode
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"strings"
 	"syscall"
 	"time"
@@ -21,31 +19,12 @@ import (
 // Spec: opencode-invoke.dog.md "Timeout — Default 120 seconds."
 const DefaultTimeout = 120 * time.Second
 
-// DefaultKillGrace is the grace period between SIGTERM and SIGKILL on timeout.
-// Spec: opencode-invoke.dog.md "Notes" — grace period pinned to 5 seconds.
+// DefaultKillGrace is the grace period between SIGTERM and SIGKILL when killing a
+// server process group on shutdown.
 const DefaultKillGrace = 5 * time.Second
 
-// DefaultExportTimeout caps a single `opencode export` invocation. The export
-// itself is a sub-second DB read; this only guards against a hung process.
-const DefaultExportTimeout = 30 * time.Second
-
-// Export retry tuning. After a run, a fresh `opencode export` returns empty (and
-// errors with "unexpected end of JSON input") for several seconds while the
-// just-written session becomes visible in opencode's SQLite store — no external
-// process holds the db, it's an internal visibility delay, and it grows with
-// session size (observed 4–7s on large research turns). So retry export with
-// capped exponential backoff until exportRetryBudget elapses, then give up. The
-// budget is a var (not const) so tests can shrink it.
-var exportRetryBudget = 45 * time.Second
-
-const (
-	exportBackoffMin = 300 * time.Millisecond
-	exportBackoffMax = 2 * time.Second
-)
-
 // Outcome enumerates the terminal categories defined in
-// docs/specs/opencode-invoke.dog.md ("Outcome"). Vendor-fallthrough categories
-// (rate-limit / quota / auth) are not yet classified — single-vendor slice.
+// docs/specs/opencode-invoke.dog.md ("Outcome").
 type Outcome int
 
 const (
@@ -69,36 +48,33 @@ func (o Outcome) String() string {
 }
 
 // Vendor is the concrete entry the pool yields per attempt. See
-// docs/specs/vendor-pool.dog.md ("Outcome — A concrete (vendor_id, model,
-// credentials)…").
+// docs/specs/vendor-pool.dog.md.
 type Vendor struct {
-	// VendorID is the stable identifier (e.g. "chatgpt-oauth").
+	// VendorID is the stable identifier (e.g. "chatgpt-oauth"). It also keys the
+	// per-vendor opencode server.
 	VendorID string
-	// Model is opencode's --model flag value (e.g. "anthropic/claude-…").
+	// Model is opencode's model id (e.g. "deepseek/deepseek-v4-pro"); split into
+	// providerID/modelID for the server API.
 	Model string
-	// CredEnv is the credentials env block exposed to the child process.
-	// Per spec: "Only the credentials of the vendor currently being attempted
-	// are exposed." Espur does not leak unrelated vendor credentials.
+	// CredEnv is the credentials env block exposed to this vendor's server.
+	// Per spec: only the credentials of the vendor being attempted are exposed.
 	CredEnv map[string]string
 }
 
 // Request bundles one invocation attempt.
 type Request struct {
 	Vendor  Vendor
-	WorkDir string // child cwd; per-thread working dir.
+	WorkDir string // session working directory (the per-thread cwd).
 	UserMsg string // composite user message from context assembly.
 	Timeout time.Duration
-	BinPath string // opencode binary; "" → look up "opencode" in PATH.
 
 	// OnMessage, if non-nil, is invoked once per completed assistant text
-	// message as the run streams, in first-seen order. This is how progressive
-	// "post each message as the agent produces it" delivery works: each call is
-	// one finished opencode assistant message (its text parts concatenated). The
-	// final message is also delivered this way — either live (its step_finish
-	// arrived on stdout) or, if opencode dropped the trailing text event, via the
-	// post-run export backstop. Callbacks run synchronously on the stdout-reader
-	// goroutine during the run and on the caller's goroutine during the backstop;
-	// they never overlap, so the callback need not be reentrant.
+	// message, in order. Each call is one finished opencode assistant message —
+	// this is how progressive "post each message as the agent produces it"
+	// delivery works. Messages stream live from the SSE event bus as they
+	// complete; any that the live stream missed are delivered by the post-turn
+	// reconcile against the authoritative message list. Callbacks run
+	// synchronously on the Invoke goroutine and never overlap.
 	OnMessage func(text string)
 }
 
@@ -106,193 +82,330 @@ type Request struct {
 type Result struct {
 	Outcome       Outcome
 	AssistantText string   // populated on Success: the final assistant message.
-	Messages      []string // populated on Success: every assistant message, in order.
+	Messages      []string // every assistant message, in order.
 	Streamed      bool     // true if ≥1 message was delivered via Request.OnMessage.
-	Stderr        string   // captured for diagnostics / failure classification.
-	Stdout        string   // raw NDJSON; kept for diagnostics.
-	ExitCode      int
+	Stderr        string   // synthesized failure detail, for vendor.Classify.
+	Stdout        string   // retained for struct compatibility; unused.
+	ExitCode      int      // retained for struct compatibility; unused.
 	Duration      time.Duration
 	// CrashReason is a short tag explaining a Crash outcome
-	// (e.g. "no_assistant_text", "no_parseable_json", "spawn_error").
+	// (e.g. "no_assistant_text", "vendor_error", "server_unavailable").
 	CrashReason string
 }
 
-// Invoke spawns `opencode run --format json --model <model>` and waits for
-// it under the spec's timeout, then classifies the outcome.
-func Invoke(ctx context.Context, req Request) (Result, error) {
-	if req.Timeout <= 0 {
-		req.Timeout = DefaultTimeout
+// Invoke runs one turn against the vendor's opencode server: create a session,
+// subscribe to its events, send the prompt synchronously, stream each completed
+// assistant message live, and reconcile against the authoritative message list
+// so nothing is lost.
+func (s *Servers) Invoke(ctx context.Context, req Request) (Result, error) {
+	timeout := req.Timeout
+	if timeout <= 0 {
+		timeout = DefaultTimeout
 	}
-	bin := req.BinPath
-	if bin == "" {
-		bin = "opencode"
+	start := time.Now()
+
+	conn, err := s.acquire(ctx, req.Vendor)
+	if err != nil {
+		return Result{Outcome: OutcomeCrash, CrashReason: "server_unavailable",
+			Stderr: err.Error(), Duration: time.Since(start)}, err
 	}
 
-	// Wall-clock timeout per spec; child is killed on expiry.
-	runCtx, cancel := context.WithTimeout(ctx, req.Timeout)
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Spec: command shape is exactly `opencode run --format json --model <m>`.
-	// The user message is delivered as a positional message argument — pinned
-	// experimentally; see spec note. `opencode run` accepts `[message..]`.
-	cmd := exec.Command(bin, "run", "--format", "json", "--model", req.Vendor.Model, req.UserMsg)
-	cmd.Dir = req.WorkDir
-
-	// Spec: "minimal env — PATH, HOME, TMPDIR, and the vendor's credentials".
-	cmd.Env = buildEnv(req.Vendor.CredEnv)
-
-	// Stream stdout: we read opencode's NDJSON line-by-line as it arrives so each
-	// assistant message can be posted the moment it completes, rather than after
-	// the whole run. Stderr is small and only consulted post-mortem for failure
-	// classification, so it stays a plain buffer. No TTY: pipes only.
-	stdoutPipe, err := cmd.StdoutPipe()
+	sid, err := conn.createSession(runCtx, req.WorkDir)
 	if err != nil {
-		return Result{Outcome: OutcomeCrash, CrashReason: "spawn_error"},
-			fmt.Errorf("opencode: stdout pipe: %w", err)
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	// Own process group so SIGTERM/SIGKILL reach opencode's child processes too.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	start := time.Now()
-	if err := cmd.Start(); err != nil {
-		return Result{
-			Outcome:     OutcomeCrash,
-			CrashReason: "spawn_error",
-			Duration:    time.Since(start),
-		}, fmt.Errorf("opencode: spawn: %w", err)
+		return Result{Outcome: OutcomeCrash, CrashReason: "session_create_failed",
+			Stderr: err.Error(), Duration: time.Since(start)}, err
 	}
 
-	// Drain + parse stdout on its own goroutine. The parser accumulates the raw
-	// bytes (for diagnostics / Classify) and emits each completed assistant
-	// message via req.OnMessage. We must read the pipe to completion before
-	// inspecting parser state, hence scanDone.
-	sp := newStreamParser(req.OnMessage)
-	scanDone := make(chan struct{})
+	events, unsub := conn.subscribe(sid)
+	defer unsub()
+
+	providerID, modelID := splitModel(req.Vendor.Model)
+	acc := newMsgAccumulator(req.OnMessage)
+
+	sendCh := make(chan sendResult, 1)
 	go func() {
-		defer close(scanDone)
-		sc := bufio.NewScanner(stdoutPipe)
-		sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-		for sc.Scan() {
-			sp.feed(sc.Bytes())
-		}
+		msg, err := conn.sendMessage(runCtx, sid, providerID, modelID, req.UserMsg)
+		sendCh <- sendResult{msg: msg, err: err}
 	}()
 
-	// Wait in a goroutine so we can race against runCtx.Done().
-	waitErr := make(chan error, 1)
-	go func() { waitErr <- cmd.Wait() }()
-
-	var timedOut bool
-	select {
-	case err = <-waitErr:
-	case <-runCtx.Done():
-		// Spec: "SIGTERM then SIGKILL after a grace period of a few seconds".
-		timedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
-		killGroup(cmd.Process.Pid, syscall.SIGTERM)
+	var (
+		send     sendResult
+		gotSend  bool
+		sessErr  json.RawMessage
+		idleSeen bool
+		timedOut bool
+	)
+	// consume folds one event in, reporting whether it was the turn-end marker.
+	consume := func(ev event) bool {
+		if ev.Type == "session.idle" {
+			return true
+		}
+		acc.handle(ev, &sessErr)
+		return false
+	}
+loop:
+	for {
 		select {
-		case err = <-waitErr:
-		case <-time.After(DefaultKillGrace):
-			killGroup(cmd.Process.Pid, syscall.SIGKILL)
-			err = <-waitErr
+		case ev := <-events:
+			if consume(ev) {
+				idleSeen = true
+			}
+		case send = <-sendCh:
+			gotSend = true
+			break loop
+		case <-runCtx.Done():
+			timedOut = errors.Is(runCtx.Err(), context.DeadlineExceeded)
+			break loop
 		}
 	}
-	<-scanDone // all stdout drained & parsed; parser state is now safe to read.
 
-	res := Result{
-		Stdout:   sp.rawStdout(),
-		Stderr:   stderr.String(),
-		Duration: time.Since(start),
-		Messages: sp.messages(),
-		Streamed: sp.count() > 0,
-	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		res.ExitCode = exitErr.ExitCode()
-	} else if err != nil && !timedOut {
-		// Non-exit error from Wait itself (e.g. I/O) — treat as crash.
-		res.Outcome = OutcomeCrash
-		res.CrashReason = "wait_error"
-		return res, fmt.Errorf("opencode: wait: %w", err)
-	}
+	res := Result{Duration: time.Since(start)}
 
-	if timedOut {
-		// Spec: "A timeout is not counted as a vendor failure". Just report it.
-		// Any messages already streamed stand; the caller posts the timeout note.
+	// Timeout: abort the turn on the server and return whatever streamed. Spec:
+	// a timeout is not a vendor failure; already-streamed messages stand.
+	if timedOut && !gotSend {
+		actx, acancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = conn.abort(actx, sid)
+		acancel()
+		<-sendCh // reap the send goroutine (sendMessage returns once runCtx cancels)
 		res.Outcome = OutcomeTimeout
+		res.Messages = acc.messages()
+		res.Streamed = acc.count() > 0
+		if n := len(res.Messages); n > 0 {
+			res.AssistantText = res.Messages[n-1]
+		}
 		return res, nil
 	}
 
-	if sp.sessionID == "" {
-		res.Outcome = OutcomeCrash
-		res.CrashReason = "no_parseable_json"
-		return res, nil
-	}
-
-	// Flush the final message from stdout. opencode often exits right after the
-	// last message's text without emitting its closing step_finish, so that text
-	// is in the parser but not yet delivered. The process exited cleanly (not a
-	// timeout — handled above), so the accumulated text is complete: emit it
-	// live and skip the export round-trip. Only a genuinely dropped final text
-	// event leaves nothing to flush, falling through to the backstop.
-	sp.flushFinal()
-
-	// Export backstop. The stdout stream is the primary source: each assistant
-	// message is emitted as its step_finish arrives. But opencode intermittently
-	// drops the trailing type=text event, so the final message's text can be
-	// missing from stdout even though the run produced it. The session export
-	// holds it — once the freshly-written session settles in opencode's store.
-	//
-	// We only export when stdout left a gap: either no message streamed at all,
-	// or the final message (the last messageID stdout announced via step_start)
-	// never got its text. The retry is keyed on that final messageID — we wait
-	// until the export actually contains it, instead of accepting the first
-	// non-empty read. That precision is what stops a stale mid-turn snapshot from
-	// serving an earlier preamble as the answer.
-	//
-	// Export's context is the caller's, not runCtx: if `opencode run` finished
-	// right at the deadline, runCtx may already be canceled and exec would kill
-	// `opencode export` before it prints anything.
-	var exportErr error
-	if sp.count() == 0 || !sp.emittedFinal() {
-		var msgs []exportMsg
-		msgs, exportErr = exportAssistantMessagesRetry(ctx, bin, sp.sessionID, sp.finalMessageID(), req.Vendor.CredEnv)
-		if exportErr == nil {
-			for _, em := range msgs {
-				// Emit only messages stdout didn't already deliver, preserving
-				// order; the recovered tail goes out after the streamed prefix.
-				sp.emitExternal(em.ID, em.Text)
+	// Turn finished. The synchronous response can land before the tail of the SSE
+	// stream (a final message.updated, or a session.error that precedes idle), so
+	// drain through session.idle — bounded, in case idle never arrives — to
+	// observe those trailing events. If idle was already seen in the main loop,
+	// only the buffered remainder is left.
+	if !idleSeen {
+		idleDeadline := time.After(500 * time.Millisecond)
+	drain:
+		for {
+			select {
+			case ev := <-events:
+				if consume(ev) {
+					break drain
+				}
+			case <-idleDeadline:
+				break drain
+			}
+		}
+	} else {
+		for drained := true; drained; {
+			select {
+			case ev := <-events:
+				consume(ev)
+			default:
+				drained = false
 			}
 		}
 	}
 
-	texts := sp.messages()
-	if len(texts) == 0 {
-		// Nothing from either source. Distinguish a hard export failure from a
-		// run that simply produced no assistant text (spec: "A zero exit code
-		// with no usable assistant text is also a crash").
-		if exportErr != nil {
-			res.Outcome = OutcomeCrash
-			res.CrashReason = "export_failed"
-			return res, exportErr
+	recCtx, recCancel := context.WithTimeout(ctx, 10*time.Second)
+	msgs, listErr := conn.listMessages(recCtx, sid)
+	recCancel()
+	if listErr == nil {
+		for _, m := range msgs {
+			if m.Info.Role == "assistant" {
+				acc.emitText(m.Info.ID, m.text())
+			}
 		}
+	} else if gotSend && send.err == nil && send.msg.Info.Role == "assistant" {
+		// Authoritative list unavailable — fall back to the sync response, which
+		// at least carries the final message.
+		acc.emitText(send.msg.Info.ID, send.msg.text())
+	}
+
+	res.Messages = acc.messages()
+	res.Streamed = acc.count() > 0
+	if n := len(res.Messages); n > 0 {
+		res.AssistantText = res.Messages[n-1]
+	}
+
+	// A genuine vendor/runtime error (structured session.error, a non-2xx send,
+	// or an error on the final message) is a crash. Its detail goes to Stderr so
+	// vendor.Classify can decide fallthrough vs. penalty. Streamed stays set so
+	// the pool won't replay the turn on another vendor after we've already posted.
+	if errText := classifyFailure(sessErr, send, gotSend); errText != "" {
+		res.Stderr = errText
+		res.Outcome = OutcomeCrash
+		res.CrashReason = "vendor_error"
+		return res, errors.New(errText)
+	}
+
+	if len(res.Messages) == 0 {
+		// Clean turn that produced no assistant text (e.g. tool-only). Spec: a
+		// turn with no usable assistant text is a crash.
 		res.Outcome = OutcomeCrash
 		res.CrashReason = "no_assistant_text"
 		return res, nil
 	}
-	res.Messages = texts
-	res.Streamed = sp.count() > 0
-	res.AssistantText = texts[len(texts)-1]
+
 	res.Outcome = OutcomeSuccess
 	return res, nil
+}
+
+// sendResult carries the synchronous prompt outcome from its goroutine.
+type sendResult struct {
+	msg apiMessage
+	err error
+}
+
+// classifyFailure renders any vendor/runtime error into a single string for
+// vendor.Classify (which scans for statusCode/auth/rate-limit phrases). Returns
+// "" when the turn carried no error.
+func classifyFailure(sessErr json.RawMessage, send sendResult, gotSend bool) string {
+	var parts []string
+	if !isNull(sessErr) {
+		parts = append(parts, "session error: "+string(sessErr))
+	}
+	if gotSend && send.err != nil {
+		parts = append(parts, send.err.Error())
+	}
+	if gotSend && send.err == nil && !isNull(send.msg.Info.Error) {
+		parts = append(parts, "message error: "+string(send.msg.Info.Error))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func isNull(r json.RawMessage) bool {
+	s := strings.TrimSpace(string(r))
+	return s == "" || s == "null"
+}
+
+// splitModel divides "provider/model-id" into its providerID and modelID on the
+// first slash (e.g. "deepseek/deepseek-v4-pro" → "deepseek", "deepseek-v4-pro").
+func splitModel(model string) (providerID, modelID string) {
+	if i := strings.IndexByte(model, '/'); i >= 0 {
+		return model[:i], model[i+1:]
+	}
+	return "", model
+}
+
+// --- assistant-message accumulator ---
+
+// msgAccumulator reconstructs assistant messages from SSE part updates and
+// delivers each completed one exactly once via onMessage, in first-delivered
+// order. Text parts arrive as repeated message.part.updated events for the same
+// part id (growing text), so text is keyed by part id with last-value-wins and
+// concatenated in first-seen order — then emitted when the message completes
+// (message.updated with time.completed) or recovered by the reconcile.
+type msgAccumulator struct {
+	onMessage func(string)
+
+	parts   map[string]map[string]string // messageID -> partID -> text
+	order   map[string][]string          // messageID -> partID first-seen order
+	emitted map[string]bool              // messageID -> already delivered
+	seq     []string                     // delivered messageIDs, in order
+	byID    map[string]string            // messageID -> delivered text
+	extSeq  int                          // synthesizes keys for id-less messages
+}
+
+func newMsgAccumulator(onMessage func(string)) *msgAccumulator {
+	return &msgAccumulator{
+		onMessage: onMessage,
+		parts:     map[string]map[string]string{},
+		order:     map[string][]string{},
+		emitted:   map[string]bool{},
+		byID:      map[string]string{},
+	}
+}
+
+// handle folds one SSE event into the accumulator, emitting live on completion.
+func (a *msgAccumulator) handle(ev event, sessErr *json.RawMessage) {
+	switch ev.Type {
+	case "message.part.updated":
+		if ev.Part != nil && ev.Part.Type == "text" && ev.Part.MessageID != "" {
+			a.addPart(ev.Part.MessageID, ev.Part.ID, ev.Part.Text)
+		}
+	case "message.updated":
+		if ev.Info != nil && ev.Info.Role == "assistant" && ev.Info.Time.Completed > 0 {
+			a.emitText(ev.Info.ID, a.assemble(ev.Info.ID))
+		}
+		if ev.Info != nil && !isNull(ev.Info.Error) {
+			*sessErr = ev.Info.Error
+		}
+	case "session.error":
+		if !isNull(ev.Error) {
+			*sessErr = ev.Error
+		}
+	}
+}
+
+func (a *msgAccumulator) addPart(mid, pid, text string) {
+	if a.parts[mid] == nil {
+		a.parts[mid] = map[string]string{}
+	}
+	if _, seen := a.parts[mid][pid]; !seen {
+		a.order[mid] = append(a.order[mid], pid)
+	}
+	a.parts[mid][pid] = text
+}
+
+func (a *msgAccumulator) assemble(mid string) string {
+	var b strings.Builder
+	for _, pid := range a.order[mid] {
+		b.WriteString(a.parts[mid][pid])
+	}
+	return b.String()
+}
+
+// emitText delivers text for a message exactly once. An id-less message (a
+// malformed/test fixture) gets a synthetic key so it still emits.
+func (a *msgAccumulator) emitText(mid, text string) {
+	if mid == "" {
+		mid = "__ext_" + itoa(a.extSeq)
+		a.extSeq++
+	}
+	if a.emitted[mid] || strings.TrimSpace(text) == "" {
+		return
+	}
+	a.emitted[mid] = true
+	a.seq = append(a.seq, mid)
+	a.byID[mid] = text
+	if a.onMessage != nil {
+		a.onMessage(text)
+	}
+}
+
+func (a *msgAccumulator) count() int { return len(a.seq) }
+
+func (a *msgAccumulator) messages() []string {
+	out := make([]string, 0, len(a.seq))
+	for _, mid := range a.seq {
+		out = append(out, a.byID[mid])
+	}
+	return out
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
 }
 
 // buildEnv assembles the minimal env per spec: PATH, HOME, TMPDIR, plus the
 // vendor's credentials. The XDG_* variables are passed through too so that
 // opencode's own auth.json (used by OAuth providers — see docs/specs/oauth.dog.md)
-// is resolved from a shared, persistent location across espur invocations
-// and `opencode auth login` runs. Espur's own master key and unrelated vendor
-// creds are deliberately excluded.
+// is resolved from a shared, persistent location across espur invocations and
+// `opencode auth login` runs. Espur's own master key and unrelated vendor creds
+// are deliberately excluded — only the attempted vendor's creds reach its server.
 func buildEnv(creds map[string]string) []string {
 	out := make([]string, 0, 6+len(creds))
 	for _, k := range []string{"PATH", "HOME", "TMPDIR", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"} {
@@ -300,9 +413,9 @@ func buildEnv(creds map[string]string) []string {
 			out = append(out, k+"="+v)
 		}
 	}
-	// Operator-supplied passthrough: comma-separated env var names to forward
-	// to opencode children. Lets a deployment hand the child non-vendor secrets
-	// (e.g. keys consumed by user-installed skills) without code changes.
+	// Operator-supplied passthrough: comma-separated env var names to forward to
+	// opencode servers. Lets a deployment hand the child non-vendor secrets (e.g.
+	// keys consumed by user-installed skills) without code changes.
 	for _, k := range strings.Split(os.Getenv("ESPUR_OPENCODE_ENV_PASSTHROUGH"), ",") {
 		k = strings.TrimSpace(k)
 		if k == "" {
@@ -321,318 +434,4 @@ func buildEnv(creds map[string]string) []string {
 func killGroup(pid int, sig syscall.Signal) {
 	// Negative pid → signal the whole process group.
 	_ = syscall.Kill(-pid, sig)
-}
-
-// opencode --format json emits NDJSON events on stdout. Each carries the
-// session ID; the first event (step_start) is enough to pull the full
-// session record after the run completes.
-type ocEvent struct {
-	Type      string `json:"type"`
-	SessionID string `json:"sessionID"`
-}
-
-func extractSessionID(r io.Reader) (string, error) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		var ev ocEvent
-		if err := json.Unmarshal(line, &ev); err != nil {
-			continue
-		}
-		if ev.SessionID != "" {
-			return ev.SessionID, nil
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return "", err
-	}
-	return "", errors.New("no session id in opencode stdout")
-}
-
-// ocExport mirrors the JSON shape returned by `opencode export <sessionID>`.
-// We care about assistant messages: their id (to match the run's messageID),
-// their text parts, and whether they carry a tool call (a settle signal).
-type ocExport struct {
-	Messages []struct {
-		Info struct {
-			ID   string `json:"id"`
-			Role string `json:"role"`
-		} `json:"info"`
-		Parts []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"parts"`
-	} `json:"messages"`
-}
-
-// exportMsg is one assistant message distilled from the session export.
-type exportMsg struct {
-	ID      string
-	Text    string
-	HasTool bool
-}
-
-// streamParser consumes `opencode run --format json` NDJSON line-by-line as the
-// child writes it, reconstructs each assistant message, and emits it via
-// onMessage the moment it completes (its step_finish event). opencode emits one
-// "message" per step (a model call); a message that calls a tool ends its step
-// and the model continues in a new message, so step_finish is a reliable
-// per-message boundary.
-//
-// Text parts stream as repeated events for the same part id (growing text), so
-// text is keyed by part id with last-value-wins and concatenated in first-seen
-// order — the same reconstruction the export uses. Tool-only and empty messages
-// produce no emit.
-type streamParser struct {
-	onMessage func(string)
-
-	raw       bytes.Buffer                 // verbatim stdout, for diagnostics/Classify
-	sessionID string                       // first sessionID seen
-	lastMsgID string                       // most recent messageID announced (step_start/text)
-	text      map[string]map[string]string // messageID -> partID -> text
-	partOrder map[string][]string          // messageID -> partID first-seen order
-	emitted   map[string]bool              // messageID -> already emitted
-	order     []string                     // emitted messages, in emit order
-	byID      map[string]string            // messageID -> emitted text
-	extSeq    int                          // synthesizes keys for id-less backstop messages
-}
-
-func newStreamParser(onMessage func(string)) *streamParser {
-	return &streamParser{
-		onMessage: onMessage,
-		text:      map[string]map[string]string{},
-		partOrder: map[string][]string{},
-		emitted:   map[string]bool{},
-		byID:      map[string]string{},
-	}
-}
-
-// streamEvent is the slice of an NDJSON run event the parser reads.
-type streamEvent struct {
-	Type      string `json:"type"`
-	SessionID string `json:"sessionID"`
-	Part      struct {
-		ID        string `json:"id"`
-		MessageID string `json:"messageID"`
-		Type      string `json:"type"`
-		Text      string `json:"text"`
-	} `json:"part"`
-}
-
-// feed parses one raw stdout line, updating state and emitting on a boundary.
-func (sp *streamParser) feed(line []byte) {
-	sp.raw.Write(line)
-	sp.raw.WriteByte('\n')
-
-	trimmed := bytes.TrimSpace(line)
-	if len(trimmed) == 0 {
-		return
-	}
-	var ev streamEvent
-	if json.Unmarshal(trimmed, &ev) != nil {
-		return
-	}
-	if sp.sessionID == "" && ev.SessionID != "" {
-		sp.sessionID = ev.SessionID
-	}
-	mid := ev.Part.MessageID
-	switch ev.Type {
-	case "step_start":
-		if mid != "" {
-			sp.lastMsgID = mid
-		}
-	case "text":
-		if mid == "" || ev.Part.Type != "text" || ev.Part.Text == "" {
-			return
-		}
-		sp.lastMsgID = mid
-		if sp.text[mid] == nil {
-			sp.text[mid] = map[string]string{}
-		}
-		if _, seen := sp.text[mid][ev.Part.ID]; !seen {
-			sp.partOrder[mid] = append(sp.partOrder[mid], ev.Part.ID)
-		}
-		sp.text[mid][ev.Part.ID] = ev.Part.Text
-	case "step_finish":
-		if mid == "" {
-			mid = sp.lastMsgID
-		}
-		sp.emitIfText(mid)
-	}
-}
-
-// assembled concatenates a message's text parts in first-seen order.
-func (sp *streamParser) assembled(mid string) string {
-	var b strings.Builder
-	for _, pid := range sp.partOrder[mid] {
-		b.WriteString(sp.text[mid][pid])
-	}
-	return b.String()
-}
-
-// emitIfText delivers a completed message's text exactly once, if non-empty.
-func (sp *streamParser) emitIfText(mid string) {
-	sp.deliver(mid, sp.assembled(mid))
-}
-
-// flushFinal emits the last announced message from its accumulated stdout text
-// if it has not already been delivered (no closing step_finish arrived). Called
-// only after a clean exit, so the text is complete.
-func (sp *streamParser) flushFinal() {
-	if sp.lastMsgID != "" {
-		sp.emitIfText(sp.lastMsgID)
-	}
-}
-
-// emitExternal delivers text recovered from the export backstop for a message
-// stdout didn't already emit, preserving the "emit once" and ordering contract.
-// A message already streamed (matched by id) is skipped; an id-less export
-// message (malformed / test fixture) gets a synthetic key so it still emits.
-func (sp *streamParser) emitExternal(mid, text string) {
-	if mid == "" {
-		mid = fmt.Sprintf("__ext_%d", sp.extSeq)
-		sp.extSeq++
-	}
-	sp.deliver(mid, text)
-}
-
-func (sp *streamParser) deliver(mid, text string) {
-	if mid == "" || sp.emitted[mid] || strings.TrimSpace(text) == "" {
-		return
-	}
-	sp.emitted[mid] = true
-	sp.order = append(sp.order, mid)
-	sp.byID[mid] = text
-	if sp.onMessage != nil {
-		sp.onMessage(text)
-	}
-}
-
-func (sp *streamParser) rawStdout() string { return sp.raw.String() }
-func (sp *streamParser) count() int        { return len(sp.order) }
-
-// finalMessageID is the last messageID the run announced — the message the
-// export backstop must wait for before it is considered settled.
-func (sp *streamParser) finalMessageID() string { return sp.lastMsgID }
-
-// emittedFinal reports whether the final announced message was already emitted
-// from stdout (so no export tail recovery is needed).
-func (sp *streamParser) emittedFinal() bool {
-	return sp.lastMsgID != "" && sp.emitted[sp.lastMsgID]
-}
-
-// messages returns the emitted assistant messages in order.
-func (sp *streamParser) messages() []string {
-	out := make([]string, 0, len(sp.order))
-	for _, mid := range sp.order {
-		out = append(out, sp.byID[mid])
-	}
-	return out
-}
-
-// exportAssistantMessagesRetry reads the session's assistant messages, retrying
-// while the export errors (a read-only, idempotent DB read) or has not yet
-// settled. Right after `opencode run` exits, a fresh export can error with empty
-// output for several seconds — the just-written session is not yet visible in
-// opencode's SQLite store, and that window grows with session size (observed
-// 4–7s on large research turns against opencode 1.15.13). The session can also
-// be visible but mid-write: present yet missing its final message.
-//
-// "Settled" is keyed on finalID (the last messageID the run streamed): the
-// export is settled once it contains that message. This is far more precise than
-// "first non-empty read" — it is exactly what prevents a stale snapshot whose
-// tail is still a preamble from being accepted as the answer. When finalID is
-// unknown, fall back to "the last assistant message carries no tool call" (a
-// tool-call tail means the model will continue, i.e. mid-turn).
-//
-// On budget exhaustion the last (msgs, err) is returned verbatim so the caller
-// still distinguishes export_failed (err != nil) from no_assistant_text.
-func exportAssistantMessagesRetry(parent context.Context, bin, sessionID, finalID string, creds map[string]string) ([]exportMsg, error) {
-	ctx, cancel := context.WithTimeout(parent, exportRetryBudget)
-	defer cancel()
-	settled := func(msgs []exportMsg) bool {
-		if finalID == "" {
-			// stdout never announced a final message (degenerate: no step_start
-			// reached us). With no target to wait for, accept the first
-			// successful read — a parsed export is then definitive, including a
-			// definitive "no assistant message" (matches the legacy semantics
-			// and keeps the no_assistant_text path fast).
-			return true
-		}
-		for _, m := range msgs {
-			if m.ID == finalID {
-				return true
-			}
-		}
-		return false
-	}
-	var (
-		msgs    []exportMsg
-		err     error
-		backoff = exportBackoffMin
-	)
-	for attempt := 0; ; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return msgs, err // budget exhausted — surface the last result
-			case <-time.After(backoff):
-			}
-			if backoff *= 2; backoff > exportBackoffMax {
-				backoff = exportBackoffMax
-			}
-		}
-		attemptCtx, attemptCancel := context.WithTimeout(ctx, DefaultExportTimeout)
-		msgs, err = exportAssistantMessages(attemptCtx, bin, sessionID, creds)
-		attemptCancel()
-		if err == nil && settled(msgs) {
-			return msgs, nil
-		}
-		if ctx.Err() != nil {
-			return msgs, err
-		}
-	}
-}
-
-// exportAssistantMessages returns the session's assistant messages in order.
-func exportAssistantMessages(ctx context.Context, bin, sessionID string, creds map[string]string) ([]exportMsg, error) {
-	cmd := exec.CommandContext(ctx, bin, "export", sessionID)
-	// Match the run env so auth.json + XDG resolution is consistent. We
-	// also propagate the same CredEnv: BYO-key vendors need their key
-	// available to `opencode export` too (it talks to the same API to
-	// fetch the session record). Test fakes use this channel to control
-	// the fake binary's behaviour.
-	cmd.Env = buildEnv(creds)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("opencode export %s: %w (stderr=%s)", sessionID, err, stderr.String())
-	}
-	var exp ocExport
-	if err := json.Unmarshal(stdout.Bytes(), &exp); err != nil {
-		return nil, fmt.Errorf("opencode export %s: parse: %w", sessionID, err)
-	}
-	var out []exportMsg
-	for _, m := range exp.Messages {
-		if m.Info.Role != "assistant" {
-			continue
-		}
-		var b strings.Builder
-		hasTool := false
-		for _, p := range m.Parts {
-			switch p.Type {
-			case "text":
-				b.WriteString(p.Text)
-			case "tool":
-				hasTool = true
-			}
-		}
-		out = append(out, exportMsg{ID: m.Info.ID, Text: b.String(), HasTool: hasTool})
-	}
-	return out, nil
 }

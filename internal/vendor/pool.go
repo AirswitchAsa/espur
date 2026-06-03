@@ -21,12 +21,12 @@ type Invoker interface {
 	Invoke(ctx context.Context, req opencode.Request) (opencode.Result, error)
 }
 
-// realInvoker bridges the function-style API of internal/opencode to the
-// interface above.
-type realInvoker struct{}
+// realInvoker bridges to the opencode server manager, which runs one long-lived
+// `opencode serve` per vendor and drives each turn over HTTP + SSE.
+type realInvoker struct{ servers *opencode.Servers }
 
-func (realInvoker) Invoke(ctx context.Context, req opencode.Request) (opencode.Result, error) {
-	return opencode.Invoke(ctx, req)
+func (r realInvoker) Invoke(ctx context.Context, req opencode.Request) (opencode.Result, error) {
+	return r.servers.Invoke(ctx, req)
 }
 
 // DefaultMaxConcurrent is the default global cap on concurrent opencode
@@ -50,19 +50,31 @@ type Pool struct {
 	rngMu   sync.Mutex // math/rand.Rand is not safe for concurrent use
 	logger  *slog.Logger
 	sem     chan struct{} // global concurrency bound; nil disables the cap
+	servers *opencode.Servers
 }
 
 // New constructs a pool with the real opencode invoker and default clock,
 // with the global concurrency cap at DefaultMaxConcurrent.
 func New(db *store.DB, vault *secrets.Vault) *Pool {
+	servers := opencode.NewServers("", slog.Default())
 	return &Pool{
 		db:      db,
 		vault:   vault,
-		invoker: realInvoker{},
+		invoker: realInvoker{servers: servers},
 		now:     time.Now,
 		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
 		logger:  slog.Default(),
 		sem:     make(chan struct{}, DefaultMaxConcurrent),
+		servers: servers,
+	}
+}
+
+// Close shuts down the opencode servers (kills the per-vendor `opencode serve`
+// children). Call once on espur shutdown after invocations have drained. Safe to
+// call when no real servers were started (e.g. tests with a fake invoker).
+func (p *Pool) Close() {
+	if p.servers != nil {
+		p.servers.Close()
 	}
 }
 
@@ -77,10 +89,14 @@ func (p *Pool) WithMaxConcurrent(n int) *Pool {
 	return p
 }
 
-// WithLogger swaps the logger used for vendor-pool transitions.
+// WithLogger swaps the logger used for vendor-pool transitions (and opencode
+// server lifecycle).
 func (p *Pool) WithLogger(l *slog.Logger) *Pool {
 	if l != nil {
 		p.logger = l
+		if p.servers != nil {
+			p.servers.SetLogger(l)
+		}
 	}
 	return p
 }
